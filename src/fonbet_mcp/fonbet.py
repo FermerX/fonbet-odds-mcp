@@ -137,6 +137,100 @@ def extract_markets(
     }
 
 
+def extract_match_markets(
+    payload: dict[str, Any],
+    event_id: int,
+    offset: int = 0,
+    limit: int = 200,
+    query: str | None = None,
+    include_raw: bool = False,
+) -> dict[str, Any]:
+    """Return a match's own markets and markets of all nested sub-events.
+
+    Fonbet represents corners, cards, periods and other statistical markets as
+    separate events linked by parentId. Factor IDs are not descriptive by
+    themselves: preserve unknown labels rather than guessing them.
+    """
+    events_by_id = {
+        event["id"]: event
+        for event in _iter_events(payload)
+        if isinstance(event.get("id"), int)
+    }
+    root = events_by_id.get(event_id)
+    if root is None:
+        raise ValueError(f"Event {event_id} not found in Fonbet response")
+
+    selected_ids = {event_id}
+    # This also captures grandchildren such as first-half corners.
+    for _ in range(len(events_by_id)):
+        added = {
+            eid for eid, event in events_by_id.items()
+            if event.get("parentId") in selected_ids
+        }
+        if added.issubset(selected_ids):
+            break
+        selected_ids.update(added)
+
+    factor_blocks = _factor_blocks_by_event(payload)
+    catalog = _factor_type_catalog(payload)
+    sports = _sports_by_id(payload)
+    all_markets: list[dict[str, Any]] = []
+    subevents: list[dict[str, Any]] = []
+
+    for eid in [event_id, *(eid for eid in events_by_id if eid != event_id and eid in selected_ids)]:
+        event = events_by_id[eid]
+        # The event's own name/caption is usually "Угловые", "ЖК", etc.
+        section = str(event.get("name") or event.get("caption") or _event_name(event))
+        factors = factor_blocks.get(eid, [])
+        if eid != event_id:
+            subevents.append({
+                "event_id": eid,
+                "parent_id": event.get("parentId"),
+                "name": section,
+                "level": event.get("level"),
+                "market_count": len(factors),
+            })
+        for factor in factors:
+            if not isinstance(factor, dict):
+                continue
+            market = _normalize_factor(factor, catalog, include_raw=include_raw)
+            market["event_id"] = eid
+            market["parent_id"] = event.get("parentId")
+            market["event_level"] = event.get("level")
+            market["subevent_name"] = section if eid != event_id else None
+            if eid != event_id and not market["group"]:
+                market["group"] = section
+            all_markets.append(market)
+
+    needle = (query or "").casefold().strip()
+    filtered = [
+        market for market in all_markets
+        if not needle or needle in _market_search_text(market).casefold()
+        or needle in str(market.get("subevent_name") or "").casefold()
+    ]
+    offset = max(0, offset)
+    limit = max(1, min(limit, 500))
+    page = filtered[offset: offset + limit]
+    return {
+        "event": {
+            "id": event_id,
+            "name": _event_name(root),
+            "sport": _sport_name(sports, root.get("sportId"), prefer_root=True),
+            "league": _sport_name(sports, root.get("sportId"), prefer_root=False),
+            "start_time": root.get("startTime"),
+            "status": root.get("place") or root.get("state"),
+        },
+        "subevents": subevents,
+        "markets": page,
+        "market_count": len(filtered),
+        "total_market_count": len(all_markets),
+        "offset": offset,
+        "limit": limit,
+        "next_offset": offset + limit if offset + limit < len(filtered) else None,
+        "packet_version": payload.get("packetVersion"),
+    }
+
+
 def extract_day_specials(
     payload: dict[str, Any],
     query: str = "",
