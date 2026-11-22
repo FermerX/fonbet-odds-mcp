@@ -250,6 +250,95 @@ def extract_match_markets(
     }
 
 
+def extract_unlabeled_pairs(
+    payload: dict[str, Any],
+    event_id: int,
+    section: str = "",
+    offset: int = 0,
+    limit: int = 100,
+    line_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Audit unidentified adjacent factor IDs at the same line.
+
+    Returns *candidates* only. An adjacent ID is not proof of an over/under
+    pair, nor proof that it is an individual team total. The API deliberately
+    does not label the first or second selection as "over", "under", "team 1"
+    or "team 2" until metadata from Fonbet confirms it.
+    """
+    markets: list[dict[str, Any]] = []
+    cursor = 0
+    while True:
+        page = extract_match_markets(
+            payload, event_id=event_id, offset=cursor, limit=500,
+            line_payload=line_payload,
+        )
+        markets.extend(page["markets"])
+        next_cursor = page["next_offset"]
+        if next_cursor is None:
+            break
+        cursor = next_cursor
+
+    needle = section.casefold().strip()
+    buckets: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for market in markets:
+        # Use only *unidentified* selections with a numeric factor id,
+        # a quoted price and an explicit line parameter.
+        if market.get("name") is not None:
+            continue
+        factor_id = market.get("factor_id")
+        param_text = market.get("param_text")
+        price = market.get("odds")
+        if not isinstance(factor_id, int) or param_text in (None, ""):
+            continue
+        if not isinstance(price, (int, float)) or price <= 1:
+            continue
+        section_name = market.get("subevent_name") or "Матч"
+        if needle and needle not in str(section_name).casefold():
+            continue
+        buckets.setdefault((market["event_id"], str(param_text)), []).append(market)
+
+    pairs: list[dict[str, Any]] = []
+    for (_, param_text), group in buckets.items():
+        factors = sorted(group, key=lambda m: m["factor_id"])
+        used: set[int] = set()
+        for idx in range(len(factors) - 1):
+            left = factors[idx]
+            right = factors[idx + 1]
+            fid = left["factor_id"]
+            rid = right["factor_id"]
+            if fid in used or rid in used or rid != fid + 1:
+                continue
+            used.update((fid, rid))
+            pairs.append({
+                "event_id": left["event_id"],
+                "subevent_name": left.get("subevent_name") or "Матч",
+                "param_text": param_text,
+                "selections": [
+                    {"factor_id": fid, "odds": left["odds"]},
+                    {"factor_id": rid, "odds": right["odds"]},
+                ],
+                "verified_market_type": False,
+                "verified_team": False,
+                "verified_direction": False,
+            })
+    pairs.sort(key=lambda p: (p["event_id"], p["selections"][0]["factor_id"]))
+    offset = max(0, offset)
+    limit = max(1, min(limit, 500))
+    return {
+        "event": page["event"],
+        "section_filter": section,
+        "pair_count": len(pairs),
+        "pairs": pairs[offset:offset + limit],
+        "offset": offset,
+        "limit": limit,
+        "next_offset": offset + limit if offset + limit < len(pairs) else None,
+        "warning": (
+            "Pairs are unverified factor-ID neighbors. Do not interpret them "
+            "as team totals or over/under bets without separate verification."
+        ),
+    }
+
+
 def extract_day_specials(
     payload: dict[str, Any],
     query: str = "",
