@@ -229,6 +229,79 @@ class MatchMarketTests(unittest.TestCase):
         result = extract_match_markets(payload, event_id=10)
         self.assertTrue(all(m["name"] is None for m in result["markets"]))
 
+    def test_unverified_goal_card_hypotheses_only_for_full_match(self):
+        payload = {
+            "sports": [{"id": 1, "kind": "sport", "name": "Футбол"}],
+            "events": [
+                {"id": 10, "sportId": 1, "team1": "Брентфорд", "team2": "Эвертон"},
+                {"id": 11, "sportId": 1, "name": "желтые карты", "parentId": 10},
+                {"id": 12, "sportId": 1, "name": "1-й тайм желтые карты", "parentId": 10},
+                {"id": 13, "sportId": 1, "name": "угловые", "parentId": 10},
+            ],
+            "customFactors": [
+                {"e": 10, "factors": [
+                    {"f": 1809, "pt": "0.5", "v": 1.20},
+                    {"f": 1810, "pt": "0.5", "v": 4.00},
+                    {"f": 1854, "pt": "0.5", "v": 1.30},
+                    {"f": 1871, "pt": "0.5", "v": 3.20},
+                    {"f": 1812, "pt": "1", "v": 1.40},  # missing under
+                ]},
+                {"e": 11, "factors": [
+                    {"f": 1809, "pt": "1.5", "v": 1.84},
+                    {"f": 1810, "pt": "1.5", "v": 1.86},
+                    {"f": 1854, "pt": "1.5", "v": 1.65},
+                    {"f": 1871, "pt": "1.5", "v": 2.10},
+                ]},
+                {"e": 12, "factors": [
+                    {"f": 1809, "pt": "0.5", "v": 1.50},
+                    {"f": 1810, "pt": "0.5", "v": 2.50},
+                ]},
+                {"e": 13, "factors": [
+                    {"f": 1809, "pt": "4.5", "v": 1.37},
+                    {"f": 1810, "pt": "4.5", "v": 2.85},
+                ]},
+            ],
+        }
+        result = extract_unlabeled_pairs(payload, event_id=10)
+        candidates = result["calibration_hypotheses"]
+        self.assertEqual(len(candidates), 4)
+        self.assertEqual(
+            {(c["market_section"], c["hypothesized_team"]) for c in candidates},
+            {("голы", "Брентфорд"), ("голы", "Эвертон"),
+             ("желтые карты", "Брентфорд"), ("желтые карты", "Эвертон")},
+        )
+        self.assertTrue(all(not c["verified_for_this_market"] for c in candidates))
+        self.assertEqual(
+            next(c for c in candidates if c["market_section"] == "голы" and c["hypothesized_team"] == "Эвертон")["hypothesized_under"]["factor_id"],
+            1871,
+        )
+        # No premature promotion to confirmed market labels.
+        underlying = extract_match_markets(payload, event_id=10)
+        self.assertTrue(all(m["name"] is None for m in underlying["markets"] if m["subevent_name"] in (None, "желтые карты")))
+
+    def test_team_hypotheses_are_filtered_by_section_and_reject_other_sports(self):
+        payload = {
+            "sports": [{"id": 1, "kind": "sport", "name": "Футбол"}],
+            "events": [
+                {"id": 10, "sportId": 1, "team1": "A", "team2": "B"},
+                {"id": 11, "sportId": 1, "name": "желтые карты", "parentId": 10},
+            ],
+            "customFactors": [
+                {"e": 10, "factors": [{"f": 1809, "pt": "1.5", "v": 1.5},
+                                     {"f": 1810, "pt": "1.5", "v": 2.3}]},
+                {"e": 11, "factors": [{"f": 1854, "pt": "1.5", "v": 1.7},
+                                     {"f": 1871, "pt": "1.5", "v": 2.1}]},
+            ],
+        }
+        cards = extract_unlabeled_pairs(payload, 10, section="желт")
+        goals = extract_unlabeled_pairs(payload, 10, section="Матч")
+        self.assertEqual(cards["calibration_hypothesis_count"], 1)
+        self.assertEqual(cards["calibration_hypotheses"][0]["market_section"], "желтые карты")
+        self.assertEqual(goals["calibration_hypothesis_count"], 1)
+        self.assertEqual(goals["calibration_hypotheses"][0]["market_section"], "голы")
+        payload["sports"] = [{"id": 1, "kind": "sport", "name": "Баскетбол"}]
+        self.assertEqual(extract_unlabeled_pairs(payload, 10)["calibration_hypothesis_count"], 0)
+
     def test_pagination(self):
         a = extract_match_markets(self.payload, event_id=10, offset=0, limit=2)
         b = extract_match_markets(self.payload, event_id=10, offset=2, limit=2)
