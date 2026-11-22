@@ -385,17 +385,32 @@ def _event_name(event: dict[str, Any]) -> str:
     return str(event.get("name") or event.get("caption") or event.get("id") or "unknown")
 
 
+# Factor IDs confirmed in a historical Fonbet CFX market-cell example,
+# including quote names (not inferred from odds or position).
+# https://gist.github.com/netwood/eb27a27abe154531fd434795cff2ea3e
+# Event subtypes (goals, corners, cards) come from event.parentId and event.name.
 _KNOWN_FACTOR_NAMES: dict[int, str] = {
     921: "П1",
     922: "Ничья",
     923: "П2",
     924: "1X",
-    925: "12",
-    1571: "X2",
+    925: "X2",
+    1571: "12",
     927: "Фора 1",
     928: "Фора 2",
     930: "Тотал больше",
     931: "Тотал меньше",
+    # Alternate total markets. Pairs are >P / <P for the same parameter.
+    1696: "Тотал больше",
+    1697: "Тотал меньше",
+    1727: "Тотал больше",
+    1728: "Тотал меньше",
+    1730: "Тотал больше",
+    1731: "Тотал меньше",
+    1733: "Тотал больше",
+    1734: "Тотал меньше",
+    1736: "Тотал больше",
+    1737: "Тотал меньше",
     2820: "П1 с форой 0",
     2821: "П2 с форой 0",
     709: "Обе забьют - да",
