@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from fonbet_mcp.fonbet import extract_match_markets, _factor_type_catalog
+from fonbet_mcp.fonbet import extract_match_markets, extract_unlabeled_pairs, _factor_type_catalog
 
 
 class MatchMarketTests(unittest.TestCase):
@@ -110,6 +110,61 @@ class MatchMarketTests(unittest.TestCase):
             self.assertEqual(by_id[over_id]["group"], "угловые")
         # Individual totals are still unknown: avoid false specificity.
         self.assertNotIn(1809, by_id)
+
+    def test_unlabeled_pairs_within_same_section_and_threshold(self):
+        payload = {
+            "events": [
+                {"id": 10, "team1": "Home", "team2": "Away"},
+                {"id": 11, "name": "угловые", "parentId": 10},
+                {"id": 12, "name": "желтые карты", "parentId": 10},
+            ],
+            "customFactors": [
+                {"e": 10, "factors": [
+                    {"f": 1809, "v": 1.2, "pt": "0.5"},
+                    {"f": 1810, "v": 4.5, "pt": "0.5"},
+                    {"f": 930, "v": 1.6, "pt": "2.5"},
+                ]},
+                {"e": 11, "factors": [
+                    {"f": 1809, "v": 1.5, "pt": "4.5"},
+                    {"f": 1810, "v": 2.5, "pt": "4.5"},
+                    {"f": 1812, "v": 1.6, "pt": "5.5"},
+                    {"f": 1813, "v": 2.3, "pt": "5.5"},
+                ]},
+                {"e": 12, "factors": [
+                    {"f": 1809, "v": 1.2, "pt": "1.5"},
+                    {"f": 1810, "v": 4.0, "pt": "1.5"},
+                ]},
+            ],
+        }
+        found = extract_unlabeled_pairs(payload, event_id=10, section="углов")
+        self.assertEqual(found["pair_count"], 2)
+        self.assertEqual(
+            {tuple(sel["factor_id"] for sel in p["selections"]) for p in found["pairs"]},
+            {(1809, 1810), (1812, 1813)},
+        )
+        self.assertTrue(all(p["verified_team"] is False for p in found["pairs"]))
+        self.assertTrue(all(p["verified_direction"] is False for p in found["pairs"]))
+        self.assertTrue(all(p["subevent_name"] == "угловые" for p in found["pairs"]))
+
+    def test_unlabeled_pair_pagination_and_skip_mismatched_params(self):
+        payload = {
+            "events": [{"id": 10, "team1": "A", "team2": "B"}],
+            "customFactors": [{"e": 10, "factors": [
+                {"f": 1809, "v": 1.2, "pt": "0.5"},
+                {"f": 1810, "v": 2.4, "pt": "0.5"},
+                {"f": 1812, "v": 1.5, "pt": "1.5"},
+                {"f": 1813, "v": 2.0, "pt": "1.5"},
+                {"f": 1900, "v": 1.6, "pt": "2.5"},
+                {"f": 1901, "v": 2.1, "pt": "3.5"},
+            ]}],
+        }
+        first = extract_unlabeled_pairs(payload, event_id=10, limit=1)
+        self.assertEqual(first["pair_count"], 2)
+        self.assertEqual(first["next_offset"], 1)
+        self.assertEqual(len(first["pairs"]), 1)
+        second = extract_unlabeled_pairs(payload, event_id=10, offset=1, limit=1)
+        self.assertIsNone(second["next_offset"])
+        self.assertEqual(second["pairs"][0]["param_text"], "1.5")
 
     def test_pagination(self):
         a = extract_match_markets(self.payload, event_id=10, offset=0, limit=2)
