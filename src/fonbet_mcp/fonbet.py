@@ -137,6 +137,56 @@ def extract_markets(
     }
 
 
+# Calibrated against the two Fonbet UI screenshots for the EPL fixture
+# Brentford vs Everton. Both teams, exact thresholds and both directions
+# were matched to the same fixture's factor IDs + odds.
+# WARNING: do not apply this map to goals, cards, halves, or other sports.
+# Validation on additional fixtures should precede widening its scope.
+_VERIFIED_TEAM_CORNER_FACTOR_IDS: dict[int, tuple[int, str]] = {
+    1809: (1, "ИТБ"),
+    1810: (1, "ИТМ"),
+    1812: (1, "ИТБ"),
+    1813: (1, "ИТМ"),
+    1815: (1, "ИТБ"),
+    1816: (1, "ИТМ"),
+    # The 3.5 pair for team two is NONADJACENT.
+    1854: (2, "ИТБ"),
+    1871: (2, "ИТМ"),
+    1873: (2, "ИТБ"),
+    1874: (2, "ИТМ"),
+    1880: (2, "ИТБ"),
+    1881: (2, "ИТМ"),
+}
+
+
+def _verified_team_corner_label(
+    factor_id: Any,
+    param_text: Any,
+    root: dict[str, Any],
+    event: dict[str, Any],
+    event_id: int,
+    section_name: str,
+    sport_name: str | None,
+) -> str | None:
+    """Apply conservative screenshot-calibrated labels to full-time corners."""
+    if sport_name != "Футбол":
+        return None
+    if section_name.strip().casefold() != "угловые":
+        return None
+    if event.get("parentId") != event_id:
+        return None
+    if not isinstance(factor_id, int) or param_text in (None, ""):
+        return None
+    spec = _VERIFIED_TEAM_CORNER_FACTOR_IDS.get(factor_id)
+    if spec is None:
+        return None
+    team_number, direction = spec
+    team_name = root.get("team1") if team_number == 1 else root.get("team2")
+    if not isinstance(team_name, str) or not team_name.strip():
+        return None
+    return f"{team_name} {direction} угловых ({param_text})"
+
+
 def extract_match_markets(
     payload: dict[str, Any],
     event_id: int,
@@ -190,6 +240,8 @@ def extract_match_markets(
     all_markets: list[dict[str, Any]] = []
     subevents: list[dict[str, Any]] = []
 
+    root_sport_name = _sport_name(sports, root.get("sportId"), prefer_root=True)
+
     for eid in [event_id, *(eid for eid in events_by_id if eid != event_id and eid in selected_ids)]:
         event = events_by_id[eid]
         # The event's own name/caption is usually "Угловые", "ЖК", etc.
@@ -213,6 +265,16 @@ def extract_match_markets(
             market["subevent_name"] = section if eid != event_id else None
             if eid != event_id and not market["group"]:
                 market["group"] = section
+            # Only full-match football corners have screenshot-verified IDs.
+            if market.get("name") is None:
+                verified_label = _verified_team_corner_label(
+                    market.get("factor_id"), market.get("param_text"),
+                    root, event, event_id, section, root_sport_name,
+                )
+                if verified_label:
+                    market["name"] = verified_label
+                    market["label"] = verified_label
+                    market["mapping_source"] = "calibrated_fonbet_ui_bre_ev_corners"
             all_markets.append(market)
 
     needle = (query or "").casefold().strip()
