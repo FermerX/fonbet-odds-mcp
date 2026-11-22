@@ -39,6 +39,23 @@ class MatchMarketTests(unittest.TestCase):
         self.assertTrue(all(m["name"] is None for m in result["markets"]))
         self.assertEqual(result["markets"][0]["group"], "Угловые")
 
+    def test_main_event_details_with_child_events_only_in_line(self):
+        detail = {
+            "events": [self.payload["events"][0]],
+            "sports": self.payload["sports"],
+            "customFactors": [self.payload["customFactors"][0]],
+        }
+        line = {
+            "events": self.payload["events"],
+            "sports": self.payload["sports"],
+            "customFactors": self.payload["customFactors"],
+        }
+        result = extract_match_markets(detail, event_id=10, query="углов", line_payload=line)
+        self.assertEqual(result["market_count"], 2)
+        self.assertEqual(result["source_counts"]["event_view_events"], 1)
+        self.assertEqual(result["source_counts"]["linked_events"], 4)
+        self.assertEqual({m["event_id"] for m in result["markets"]}, {11, 13})
+
     def test_pagination(self):
         a = extract_match_markets(self.payload, event_id=10, offset=0, limit=2)
         b = extract_match_markets(self.payload, event_id=10, offset=2, limit=2)
