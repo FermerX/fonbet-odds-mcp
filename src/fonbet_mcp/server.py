@@ -11,6 +11,7 @@ from fonbet_mcp.fonbet import (
     FonbetClient,
     extract_day_specials,
     extract_markets,
+    extract_match_markets,
     extract_odds,
     search_events,
     value_check,
@@ -72,6 +73,31 @@ async def get_event_odds(
     """Get paginated Fonbet markets for one event. Use next_offset to request the next page."""
     payload = await client.event_view(event_id=event_id, lang=lang)
     return extract_markets(
+        payload,
+        event_id=event_id,
+        offset=offset,
+        limit=limit,
+        query=query or None,
+        include_raw=include_raw,
+    )
+
+
+@mcp.tool()
+async def get_match_markets(
+    event_id: int,
+    offset: int = 0,
+    limit: int = 200,
+    query: str = "",
+    include_raw: bool = False,
+    lang: str = "ru",
+) -> dict[str, Any]:
+    """Inspect a football match and linked sub-events (corners, cards, periods).
+
+    Includes parentId, subevent name and paginated markets. Unknown factor IDs
+    remain unlabeled; never infer a bet type from odds or parameter alone.
+    """
+    payload = await client.event_view(event_id=event_id, lang=lang)
+    return extract_match_markets(
         payload,
         event_id=event_id,
         offset=offset,
