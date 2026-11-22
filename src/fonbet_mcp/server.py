@@ -13,6 +13,7 @@ from fonbet_mcp.fonbet import (
     extract_day_specials,
     extract_markets,
     extract_match_markets,
+    extract_unlabeled_pairs,
     extract_odds,
     search_events,
     value_check,
@@ -109,6 +110,29 @@ async def get_match_markets(
         query=query or None,
         include_raw=include_raw,
         line_payload=line_payload,
+    )
+
+
+@mcp.tool()
+async def get_unlabeled_pairs(
+    event_id: int,
+    section: str = "",
+    offset: int = 0,
+    limit: int = 100,
+    lang: str = "ru",
+) -> dict[str, Any]:
+    """Audit unlabeled adjacent-ID pairs for a match or a market section.
+
+    Evidence only: no selection is identified as team 1/2 or over/under.
+    Use to prioritize factor IDs for manual verification against the betslip.
+    """
+    payload, line_payload = await asyncio.gather(
+        client.event_view(event_id=event_id, lang=lang),
+        client.current_line(lang=lang),
+    )
+    return extract_unlabeled_pairs(
+        payload, event_id=event_id, section=section,
+        offset=offset, limit=limit, line_payload=line_payload,
     )
 
 
