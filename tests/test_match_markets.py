@@ -166,6 +166,69 @@ class MatchMarketTests(unittest.TestCase):
         self.assertIsNone(second["next_offset"])
         self.assertEqual(second["pairs"][0]["param_text"], "1.5")
 
+    def test_calibrated_individual_full_match_corners_both_teams(self):
+        # Odds/threshold combinations from the Fonbet UI of Brentford–Everton.
+        pairs = [
+            (1809, 1810, "4.5", 1.37, 2.85, "Брентфорд"),
+            (1812, 1813, "5.5", 1.67, 2.07, "Брентфорд"),
+            (1815, 1816, "6.5", 2.17, 1.61, "Брентфорд"),
+            (1854, 1871, "3.5", 1.44, 2.60, "Эвертон"),
+            (1873, 1874, "4.5", 1.90, 1.80, "Эвертон"),
+            (1880, 1881, "5.5", 2.75, 1.40, "Эвертон"),
+        ]
+        factors = []
+        for over_id, under_id, threshold, over, under, _ in pairs:
+            factors.extend([
+                {"f": over_id, "pt": threshold, "v": over},
+                {"f": under_id, "pt": threshold, "v": under},
+            ])
+        payload = {
+            "sports": [{"id": 1, "kind": "sport", "name": "Футбол"}],
+            "events": [
+                {"id": 10, "sportId": 1, "team1": "Брентфорд", "team2": "Эвертон"},
+                {"id": 11, "sportId": 1, "name": "угловые", "parentId": 10},
+            ],
+            "customFactors": [{"e": 11, "factors": factors}],
+        }
+        actual = extract_match_markets(payload, event_id=10, query="углов")
+        by_id = {m["factor_id"]: m for m in actual["markets"]}
+        self.assertEqual(len(by_id), 12)
+        for over_id, under_id, threshold, over, under, team in pairs:
+            self.assertEqual(by_id[over_id]["name"], f"{team} ИТБ угловых ({threshold})")
+            self.assertEqual(by_id[under_id]["name"], f"{team} ИТМ угловых ({threshold})")
+            self.assertEqual(by_id[over_id]["odds"], over)
+            self.assertEqual(by_id[under_id]["odds"], under)
+            self.assertEqual(by_id[under_id]["mapping_source"], "calibrated_fonbet_ui_bre_ev_corners")
+
+        # Previously, the non-adjacent pair 1854 / 1871 was missed.
+        self.assertIn(1854, by_id)
+        self.assertIn(1871, by_id)
+        candidates = extract_unlabeled_pairs(payload, event_id=10, section="углов")
+        self.assertEqual(candidates["pair_count"], 0)
+
+    def test_corner_mapping_never_leaks_into_halves_cards_or_other_sports(self):
+        payload = {
+            "sports": [{"id": 1, "kind": "sport", "name": "Футбол"}],
+            "events": [
+                {"id": 10, "sportId": 1, "team1": "Брентфорд", "team2": "Эвертон"},
+                {"id": 11, "sportId": 1, "name": "1-й тайм угловые", "parentId": 10},
+                {"id": 12, "sportId": 1, "name": "желтые карты", "parentId": 10},
+                {"id": 13, "sportId": 1, "name": "угловые", "parentId": 11},
+            ],
+            "customFactors": [
+                {"e": 11, "factors": [{"f": 1809, "pt": "2.5", "v": 1.5}]},
+                {"e": 12, "factors": [{"f": 1809, "pt": "1.5", "v": 1.8}]},
+                {"e": 13, "factors": [{"f": 1809, "pt": "1.5", "v": 1.8}]},
+            ],
+        }
+        result = extract_match_markets(payload, event_id=10)
+        self.assertTrue(all(m["name"] is None for m in result["markets"]))
+        payload["sports"] = [{"id": 1, "kind": "sport", "name": "Баскетбол"}]
+        payload["events"].append({"id": 14, "sportId": 1, "name": "угловые", "parentId": 10})
+        payload["customFactors"].append({"e": 14, "factors": [{"f": 1809, "pt": "4.5", "v": 1.5}]})
+        result = extract_match_markets(payload, event_id=10)
+        self.assertTrue(all(m["name"] is None for m in result["markets"]))
+
     def test_pagination(self):
         a = extract_match_markets(self.payload, event_id=10, offset=0, limit=2)
         b = extract_match_markets(self.payload, event_id=10, offset=2, limit=2)
