@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Literal, cast
 
@@ -96,7 +97,10 @@ async def get_match_markets(
     Includes parentId, subevent name and paginated markets. Unknown factor IDs
     remain unlabeled; never infer a bet type from odds or parameter alone.
     """
-    payload = await client.event_view(event_id=event_id, lang=lang)
+    payload, line_payload = await asyncio.gather(
+        client.event_view(event_id=event_id, lang=lang),
+        client.current_line(lang=lang),
+    )
     return extract_match_markets(
         payload,
         event_id=event_id,
@@ -104,6 +108,7 @@ async def get_match_markets(
         limit=limit,
         query=query or None,
         include_raw=include_raw,
+        line_payload=line_payload,
     )
 
 
