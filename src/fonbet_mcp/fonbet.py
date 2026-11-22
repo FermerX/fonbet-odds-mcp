@@ -412,20 +412,26 @@ def _known_factor_label(factor_id: Any, param_text: Any) -> str | None:
     if param_text not in (None, "") and name in {"Фора 1", "Фора 2", "Тотал больше", "Тотал меньше"}:
         return f"{name} ({param_text})"
     return name
-def _factor_type_catalog(payload: dict[str, Any]) -> dict[Any, dict[str, Any]]:
-    catalog: dict[Any, dict[str, Any]] = {}
-    for value in payload.values():
-        if not isinstance(value, list):
+def _factor_type_catalog(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    """Find labels only in explicit factor/market metadata collections.
+
+    Event and sport objects also contain (id, name), but their IDs belong to
+    different namespaces. The former generic scan could falsely assign a
+    cricket league name to a football corner-bet factor ID.
+    """
+    catalog: dict[int, dict[str, Any]] = {}
+    for key in ("factorTypes", "marketTypes", "factorNames"):
+        items = payload.get(key)
+        if not isinstance(items, list):
             continue
-        for item in value:
+        for item in items:
             if not isinstance(item, dict):
                 continue
-            factor_id = item.get("id") or item.get("f") or item.get("factorId")
+            factor_id = item.get("factorId", item.get("id"))
             name = item.get("name") or item.get("title") or item.get("caption")
-            if factor_id is not None and name:
+            if isinstance(factor_id, int) and isinstance(name, str) and name.strip():
                 catalog[factor_id] = item
     return catalog
-
 
 def _normalize_factor(factor: dict[str, Any], catalog: dict[Any, dict[str, Any]], include_raw: bool = False) -> dict[str, Any]:
     factor_id = factor.get("f")
@@ -434,7 +440,7 @@ def _normalize_factor(factor: dict[str, Any], catalog: dict[Any, dict[str, Any]]
     result: dict[str, Any] = {
         "factor_id": factor_id,
         "label": known_label,
-        "name": meta.get("name") or meta.get("title") or meta.get("caption") or known_label,
+        "name": known_label or meta.get("name") or meta.get("title") or meta.get("caption"),
         "group": factor.get("g") or meta.get("group") or meta.get("groupName"),
         "odds": factor.get("v"),
         "param": factor.get("p"),
