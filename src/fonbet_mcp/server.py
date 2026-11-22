@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Literal, cast
 
@@ -11,6 +12,7 @@ from fonbet_mcp.fonbet import (
     FonbetClient,
     extract_day_specials,
     extract_markets,
+    extract_match_markets,
     extract_odds,
     search_events,
     value_check,
@@ -78,6 +80,35 @@ async def get_event_odds(
         limit=limit,
         query=query or None,
         include_raw=include_raw,
+    )
+
+
+@mcp.tool()
+async def get_match_markets(
+    event_id: int,
+    offset: int = 0,
+    limit: int = 200,
+    query: str = "",
+    include_raw: bool = False,
+    lang: str = "ru",
+) -> dict[str, Any]:
+    """Inspect a football match and linked sub-events (corners, cards, periods).
+
+    Includes parentId, subevent name and paginated markets. Unknown factor IDs
+    remain unlabeled; never infer a bet type from odds or parameter alone.
+    """
+    payload, line_payload = await asyncio.gather(
+        client.event_view(event_id=event_id, lang=lang),
+        client.current_line(lang=lang),
+    )
+    return extract_match_markets(
+        payload,
+        event_id=event_id,
+        offset=offset,
+        limit=limit,
+        query=query or None,
+        include_raw=include_raw,
+        line_payload=line_payload,
     )
 
 
