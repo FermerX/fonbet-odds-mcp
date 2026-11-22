@@ -75,6 +75,42 @@ class MatchMarketTests(unittest.TestCase):
         }
         self.assertEqual(_factor_type_catalog(payload)[123]["name"], "Verified market label")
 
+    def test_historical_double_chance_ids(self):
+        payload = {
+            "events": [{"id": 10, "team1": "Home", "team2": "Away"}],
+            "customFactors": [{"e": 10, "factors": [
+                {"f": 924, "v": 1.1}, {"f": 925, "v": 2.45},
+                {"f": 1571, "v": 1.18},
+            ]}],
+        }
+        markets = extract_match_markets(payload, event_id=10)["markets"]
+        by_id = {m["factor_id"]: m["name"] for m in markets}
+        self.assertEqual(by_id, {924: "1X", 925: "X2", 1571: "12"})
+
+    def test_verified_alternative_totals_across_markets(self):
+        pairs = ((1696, 1697), (1727, 1728), (1730, 1731),
+                 (1733, 1734), (1736, 1737))
+        factors = [
+            {"f": factor_id, "v": 1.8, "p": 350, "pt": "3.5"}
+            for pair in pairs for factor_id in pair
+        ]
+        payload = {
+            "events": [
+                {"id": 10, "team1": "Home", "team2": "Away"},
+                {"id": 11, "name": "угловые", "parentId": 10},
+            ],
+            "customFactors": [{"e": 11, "factors": factors}],
+        }
+        result = extract_match_markets(payload, event_id=10, query="углов")
+        self.assertEqual(len(result["markets"]), len(factors))
+        by_id = {m["factor_id"]: m for m in result["markets"]}
+        for over_id, under_id in pairs:
+            self.assertEqual(by_id[over_id]["name"], "Тотал больше (3.5)")
+            self.assertEqual(by_id[under_id]["name"], "Тотал меньше (3.5)")
+            self.assertEqual(by_id[over_id]["group"], "угловые")
+        # Individual totals are still unknown: avoid false specificity.
+        self.assertNotIn(1809, by_id)
+
     def test_pagination(self):
         a = extract_match_markets(self.payload, event_id=10, offset=0, limit=2)
         b = extract_match_markets(self.payload, event_id=10, offset=2, limit=2)
