@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from fonbet_mcp.fonbet import extract_match_markets
+from fonbet_mcp.fonbet import extract_match_markets, _factor_type_catalog
 
 
 class MatchMarketTests(unittest.TestCase):
@@ -55,6 +55,25 @@ class MatchMarketTests(unittest.TestCase):
         self.assertEqual(result["source_counts"]["event_view_events"], 1)
         self.assertEqual(result["source_counts"]["linked_events"], 4)
         self.assertEqual({m["event_id"] for m in result["markets"]}, {11, 13})
+
+    def test_sports_name_never_overrides_bet_factor_name(self):
+        payload = dict(self.payload)
+        payload["sports"] = [
+            *self.payload["sports"],
+            {"id": 921, "name": "Unrelated sports league"},
+            {"id": 90001, "name": "Unrelated other sport"},
+        ]
+        result = extract_match_markets(payload, event_id=10)
+        by_id = {m["factor_id"]: m for m in result["markets"]}
+        self.assertEqual(by_id[921]["name"], "П1")
+        self.assertIsNone(by_id[90001]["name"])
+
+    def test_only_explicit_factor_metadata_is_read(self):
+        payload = {
+            "sports": [{"id": 123, "name": "Wrong sport name"}],
+            "factorTypes": [{"factorId": 123, "name": "Verified market label"}],
+        }
+        self.assertEqual(_factor_type_catalog(payload)[123]["name"], "Verified market label")
 
     def test_pagination(self):
         a = extract_match_markets(self.payload, event_id=10, offset=0, limit=2)
