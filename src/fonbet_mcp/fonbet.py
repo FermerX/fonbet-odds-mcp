@@ -312,6 +312,86 @@ def extract_match_markets(
     }
 
 
+def _team_total_calibration_hypotheses(
+    markets: list[dict[str, Any]],
+    event: dict[str, Any],
+    event_id: int,
+    root: dict[str, Any],
+    section_filter: str,
+) -> list[dict[str, Any]]:
+    """Suggest, but NEVER assert, interpretations of goal/card totals.
+
+    Observed ID/team/direction correspondence was *verified only for*
+    full-match CORNERS by two Fonbet UI screenshots. For goals and cards,
+    the same IDs are a hypothesis that requires independent UI validation.
+    Unlike the verified corner mapping, this function does NOT change
+    market["name"] or market["label"].
+    """
+    if event.get("sport") != "Футбол":
+        return []
+    teams = (root.get("team1"), root.get("team2"))
+    if not all(isinstance(t, str) and t.strip() for t in teams):
+        return []
+    # These pairs include the nonadjacent IDs 1854/1871, missed by the
+    # generic adjacent-pair diagnostic.
+    factor_pairs = (
+        (1809, 1810), (1812, 1813), (1815, 1816),
+        (1854, 1871), (1873, 1874), (1880, 1881),
+    )
+    needle = section_filter.casefold().strip()
+    buckets: dict[tuple[int, str, str], dict[int, dict[str, Any]]] = {}
+    for market in markets:
+        section = str(market.get("subevent_name") or "Матч")
+        # Only full match goals in root event, or direct full-match yellow
+        # cards child; never first-half markets or other child events.
+        if section == "Матч":
+            if market.get("event_id") != event_id:
+                continue
+            market_type = "голы"
+        elif section.casefold() == "желтые карты":
+            if market.get("parent_id") != event_id:
+                continue
+            market_type = "желтые карты"
+        else:
+            continue
+        if needle and needle not in section.casefold():
+            continue
+        if market.get("name") is not None or market.get("blocked"):
+            continue
+        fid = market.get("factor_id")
+        param_text = market.get("param_text")
+        odds = market.get("odds")
+        if fid not in _VERIFIED_TEAM_CORNER_FACTOR_IDS or param_text in ("", None):
+            continue
+        if not isinstance(odds, (int, float)) or isinstance(odds, bool) or odds <= 1:
+            continue
+        key = (market["event_id"], market_type, str(param_text))
+        buckets.setdefault(key, {})[fid] = market
+
+    hypotheses: list[dict[str, Any]] = []
+    for (subevent_id, market_type, threshold), by_id in buckets.items():
+        for over_id, under_id in factor_pairs:
+            over, under = by_id.get(over_id), by_id.get(under_id)
+            if over is None or under is None:
+                continue
+            team_no, over_direction = _VERIFIED_TEAM_CORNER_FACTOR_IDS[over_id]
+            team_no_u, under_direction = _VERIFIED_TEAM_CORNER_FACTOR_IDS[under_id]
+            if team_no != team_no_u or (over_direction, under_direction) != ("ИТБ", "ИТМ"):
+                continue
+            hypotheses.append({
+                "event_id": subevent_id,
+                "market_section": market_type,
+                "hypothesized_team": teams[team_no - 1],
+                "hypothesized_team_number": team_no,
+                "threshold": threshold,
+                "hypothesized_over": {"factor_id": over_id, "odds": over["odds"]},
+                "hypothesized_under": {"factor_id": under_id, "odds": under["odds"]},
+                "verified_for_this_market": False,
+                "evidence": "Only full-match CORNERS IDs were calibrated against Fonbet UI",
+            })
+    return sorted(hypotheses, key=lambda h: (h["event_id"], h["hypothesized_team_number"], h["hypothesized_over"]["factor_id"]))
+
+
 def extract_unlabeled_pairs(
     payload: dict[str, Any],
     event_id: int,
@@ -341,6 +421,11 @@ def extract_unlabeled_pairs(
         cursor = next_cursor
 
     needle = section.casefold().strip()
+    all_events = list(_iter_events(payload)) + list(_iter_events(line_payload or {}))
+    root = next((e for e in all_events if e.get("id") == event_id and e.get("team1") and e.get("team2")), {})
+    hypotheses = _team_total_calibration_hypotheses(
+        markets, page["event"], event_id, root, section,
+    )
     buckets: dict[tuple[int, str], list[dict[str, Any]]] = {}
     for market in markets:
         # Use only *unidentified* selections with a numeric factor id,
@@ -391,6 +476,12 @@ def extract_unlabeled_pairs(
         "section_filter": section,
         "pair_count": len(pairs),
         "pairs": pairs[offset:offset + limit],
+        "calibration_hypothesis_count": len(hypotheses),
+        "calibration_hypotheses": hypotheses,
+        "calibration_warning": (
+            "Goal/card hypotheses are extrapolated from CORNERS screenshots only; "
+            "team and over/under direction are NOT confirmed for goals/cards."
+        ),
         "offset": offset,
         "limit": limit,
         "next_offset": offset + limit if offset + limit < len(pairs) else None,
