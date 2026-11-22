@@ -144,6 +144,7 @@ def extract_match_markets(
     limit: int = 200,
     query: str | None = None,
     include_raw: bool = False,
+    line_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a match's own markets and markets of all nested sub-events.
 
@@ -151,11 +152,20 @@ def extract_match_markets(
     separate events linked by parentId. Factor IDs are not descriptive by
     themselves: preserve unknown labels rather than guessing them.
     """
-    events_by_id = {
+    # Match detail data can omit siblings/children; the current line contains
+    # parentId links. Details take precedence where both feeds have an event.
+    events_by_id: dict[int, dict[str, Any]] = {}
+    if line_payload is not None:
+        events_by_id.update({
+            event["id"]: event
+            for event in _iter_events(line_payload)
+            if isinstance(event.get("id"), int)
+        })
+    events_by_id.update({
         event["id"]: event
         for event in _iter_events(payload)
         if isinstance(event.get("id"), int)
-    }
+    })
     root = events_by_id.get(event_id)
     if root is None:
         raise ValueError(f"Event {event_id} not found in Fonbet response")
@@ -171,9 +181,12 @@ def extract_match_markets(
             break
         selected_ids.update(added)
 
-    factor_blocks = _factor_blocks_by_event(payload)
-    catalog = _factor_type_catalog(payload)
-    sports = _sports_by_id(payload)
+    factor_blocks = _factor_blocks_by_event(line_payload or {})
+    factor_blocks.update(_factor_blocks_by_event(payload))
+    catalog = _factor_type_catalog(line_payload or {})
+    catalog.update(_factor_type_catalog(payload))
+    sports = _sports_by_id(line_payload or {})
+    sports.update(_sports_by_id(payload))
     all_markets: list[dict[str, Any]] = []
     subevents: list[dict[str, Any]] = []
 
@@ -221,6 +234,12 @@ def extract_match_markets(
             "status": root.get("place") or root.get("state"),
         },
         "subevents": subevents,
+        "source_counts": {
+            "event_view_events": len(list(_iter_events(payload))),
+            "line_events": len(list(_iter_events(line_payload or {}))),
+            "linked_events": len(selected_ids),
+            "linked_subevents_with_factors": sum(1 for item in subevents if item["market_count"] > 0),
+        },
         "markets": page,
         "market_count": len(filtered),
         "total_market_count": len(all_markets),
