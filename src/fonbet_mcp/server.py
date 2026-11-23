@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 
 from fonbet_mcp.summary import find_match_candidates, summarize_match_line
+from fonbet_mcp.security import build_auth_kwargs
 
 from fonbet_mcp.config import load_settings
 from fonbet_mcp.fonbet import (
@@ -48,6 +49,7 @@ mcp = FastMCP(
         enable_dns_rebinding_protection=dns_rebinding_protection,
         allowed_hosts=allowed_hosts,
     ),
+    **build_auth_kwargs(),
 )
 
 
@@ -202,6 +204,8 @@ def main() -> None:
         Literal["stdio", "sse", "streamable-http"],
         os.getenv("MCP_TRANSPORT", "sse"),
     )
+    if os.getenv("MCP_AUTH_MODE", "none").strip().lower() == "oauth" and transport != "streamable-http":
+        raise ValueError("OAuth mode requires MCP_TRANSPORT=streamable-http")
     mcp.run(transport=transport)
 
 
