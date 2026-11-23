@@ -115,6 +115,12 @@ def build_auth_kwargs(environ: Mapping[str, str] | None = None) -> dict[str, Any
     scopes = env.get("MCP_OAUTH_REQUIRED_SCOPES", "fonbet:read").split()
     if not scopes:
         raise ValueError("MCP_OAUTH_REQUIRED_SCOPES must have at least one scope")
+    # Authorization-request scopes may include provider-specific audience hints.
+    # Such hints need not appear as scopes in the issued access token, so keep
+    # requested scopes separate from the scopes enforced by the JWT verifier.
+    request_scopes = env.get("MCP_OAUTH_REQUEST_SCOPES", " ".join(scopes)).split()
+    if not set(scopes).issubset(request_scopes):
+        raise ValueError("MCP_OAUTH_REQUEST_SCOPES must include all required scopes")
 
     verifier = JWKSJWTVerifier(
         issuer=issuer, jwks_url=jwks_url,
@@ -128,7 +134,7 @@ def build_auth_kwargs(environ: Mapping[str, str] | None = None) -> dict[str, Any
         "auth": AuthSettings(
             issuer_url=AnyHttpUrl(issuer),
             resource_server_url=AnyHttpUrl(resource_url),
-            required_scopes=scopes,
+            required_scopes=request_scopes,
             validate_token_resource=False,
         ),
     }
