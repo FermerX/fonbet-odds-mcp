@@ -222,7 +222,14 @@ class MatchMarketTests(unittest.TestCase):
             ],
         }
         result = extract_match_markets(payload, event_id=10)
-        self.assertTrue(all(m["name"] is None for m in result["markets"]))
+        # Full-match cards were independently verified by the supplied UI.
+        # The former expectation of "unlabeled" for all events is outdated.
+        self.assertEqual(
+            next(m for m in result["markets"] if m["event_id"] == 12)["name"],
+            "Брентфорд ИТБ ЖК (1.5)",
+        )
+        self.assertTrue(all(m["name"] is None for m in result["markets"]
+                            if m["event_id"] in (11, 13)))
         payload["sports"] = [{"id": 1, "kind": "sport", "name": "Баскетбол"}]
         payload["events"].append({"id": 14, "sportId": 1, "name": "угловые", "parentId": 10})
         payload["customFactors"].append({"e": 14, "factors": [{"f": 1809, "pt": "4.5", "v": 1.5}]})
