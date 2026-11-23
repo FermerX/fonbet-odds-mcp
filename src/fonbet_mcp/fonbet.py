@@ -187,6 +187,56 @@ def _verified_team_corner_label(
     return f"{team_name} {direction} угловых ({param_text})"
 
 
+# Screenshot calibration: Brentford (team 1) and Everton (team 2), full match
+# "Индивидуальные тоталы голов", thresholds 0.5, 1, 1.5, 2, 2.5.
+# All 20 decimal odds and factor IDs matched the same Fonbet MCP event.
+# Never use these mappings on card, corner, halftime, or other sports markets.
+_VERIFIED_TEAM_GOAL_FACTOR_IDS: dict[int, tuple[int, str, str]] = {
+    1809: (1, "ИТБ", "0.5"),
+    1810: (1, "ИТМ", "0.5"),
+    1812: (1, "ИТБ", "1"),
+    1813: (1, "ИТМ", "1"),
+    1815: (1, "ИТБ", "1.5"),
+    1816: (1, "ИТМ", "1.5"),
+    1818: (1, "ИТБ", "2"),
+    1819: (1, "ИТМ", "2"),
+    1821: (1, "ИТБ", "2.5"),
+    1822: (1, "ИТМ", "2.5"),
+    1854: (2, "ИТБ", "0.5"),
+    1871: (2, "ИТМ", "0.5"),
+    1873: (2, "ИТБ", "1"),
+    1874: (2, "ИТМ", "1"),
+    1880: (2, "ИТБ", "1.5"),
+    1881: (2, "ИТМ", "1.5"),
+    1883: (2, "ИТБ", "2"),
+    1884: (2, "ИТМ", "2"),
+    1886: (2, "ИТБ", "2.5"),
+    1887: (2, "ИТМ", "2.5"),
+}
+
+
+def _verified_team_goal_label(
+    factor_id: Any,
+    param_text: Any,
+    root: dict[str, Any],
+    sport_name: str | None,
+) -> str | None:
+    """Label individual full-time goals only for screenshot-confirmed IDs."""
+    if sport_name != "Футбол" or not isinstance(factor_id, int):
+        return None
+    spec = _VERIFIED_TEAM_GOAL_FACTOR_IDS.get(factor_id)
+    if spec is None:
+        return None
+    team_number, direction, verified_threshold = spec
+    # Factor IDs can be reused in submarkets. Keep the verified threshold.
+    if str(param_text) != verified_threshold:
+        return None
+    team = root.get("team1") if team_number == 1 else root.get("team2")
+    if not isinstance(team, str) or not team.strip():
+        return None
+    return f"{team} {direction} голов ({verified_threshold})"
+
+
 def extract_match_markets(
     payload: dict[str, Any],
     event_id: int,
@@ -265,6 +315,17 @@ def extract_match_markets(
             market["subevent_name"] = section if eid != event_id else None
             if eid != event_id and not market["group"]:
                 market["group"] = section
+            # Root football event = full-match goals only. Do not apply these
+            # factor IDs to cards, corners, halves or any child event.
+            if market.get("name") is None and eid == event_id:
+                goal_label = _verified_team_goal_label(
+                    market.get("factor_id"), market.get("param_text"),
+                    root, root_sport_name,
+                )
+                if goal_label:
+                    market["name"] = goal_label
+                    market["label"] = goal_label
+                    market["mapping_source"] = "calibrated_fonbet_ui_bre_ev_goals"
             # Only full-match football corners have screenshot-verified IDs.
             if market.get("name") is None:
                 verified_label = _verified_team_corner_label(

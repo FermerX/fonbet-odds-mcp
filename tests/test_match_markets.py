@@ -229,6 +229,65 @@ class MatchMarketTests(unittest.TestCase):
         result = extract_match_markets(payload, event_id=10)
         self.assertTrue(all(m["name"] is None for m in result["markets"]))
 
+    def test_calibrated_individual_full_match_goals_both_teams(self):
+        # Both screenshots for Brentford-Everton, 0.5/1/1.5/2/2.5.
+        pairs = [
+            (1809, 1810, "0.5", 1.20, 4.00, "Брентфорд"),
+            (1812, 1813, "1", 1.40, 2.70, "Брентфорд"),
+            (1815, 1816, "1.5", 2.08, 1.70, "Брентфорд"),
+            (1818, 1819, "2", 3.35, 1.27, "Брентфорд"),
+            (1821, 1822, "2.5", 4.20, 1.17, "Брентфорд"),
+            (1854, 1871, "0.5", 1.30, 3.20, "Эвертон"),
+            (1873, 1874, "1", 1.62, 2.20, "Эвертон"),
+            (1880, 1881, "1.5", 2.45, 1.52, "Эвертон"),
+            (1883, 1884, "2", 4.30, 1.20, "Эвертон"),
+            (1886, 1887, "2.5", 4.90, 1.12, "Эвертон"),
+        ]
+        factors = []
+        for over_id, under_id, threshold, over, under, _ in pairs:
+            factors.extend([
+                {"f": over_id, "pt": threshold, "v": over},
+                {"f": under_id, "pt": threshold, "v": under},
+            ])
+        payload = {
+            "sports": [{"id": 1, "kind": "sport", "name": "Футбол"}],
+            "events": [{"id": 10, "sportId": 1,
+                        "team1": "Брентфорд", "team2": "Эвертон"}],
+            "customFactors": [{"e": 10, "factors": factors}],
+        }
+        result = extract_match_markets(payload, event_id=10)
+        by_id = {m["factor_id"]: m for m in result["markets"]}
+        self.assertEqual(len(by_id), 20)
+        for over_id, under_id, threshold, over, under, team in pairs:
+            self.assertEqual(by_id[over_id]["name"], f"{team} ИТБ голов ({threshold})")
+            self.assertEqual(by_id[under_id]["name"], f"{team} ИТМ голов ({threshold})")
+            self.assertEqual(by_id[over_id]["odds"], over)
+            self.assertEqual(by_id[under_id]["odds"], under)
+            self.assertEqual(by_id[over_id]["mapping_source"], "calibrated_fonbet_ui_bre_ev_goals")
+        # Known factors disappear from the *unlabeled* diagnostic correctly.
+        self.assertEqual(extract_unlabeled_pairs(payload, event_id=10)["calibration_hypothesis_count"], 0)
+
+    def test_verified_goals_require_full_game_sport_and_threshold(self):
+        payload = {
+            "sports": [{"id": 1, "kind": "sport", "name": "Футбол"}],
+            "events": [
+                {"id": 10, "sportId": 1, "team1": "Home", "team2": "Away"},
+                {"id": 11, "sportId": 1, "name": "желтые карты", "parentId": 10},
+                {"id": 12, "sportId": 1, "name": "1-й тайм", "parentId": 10},
+            ],
+            "customFactors": [
+                {"e": 10, "factors": [{"f": 1809, "pt": "1.5", "v": 1.6}]},
+                {"e": 11, "factors": [{"f": 1809, "pt": "0.5", "v": 1.5}]},
+                {"e": 12, "factors": [{"f": 1809, "pt": "0.5", "v": 1.7}]},
+            ],
+        }
+        result = extract_match_markets(payload, event_id=10)
+        self.assertTrue(all(m["name"] is None for m in result["markets"]))
+        payload["sports"] = [{"id": 1, "kind": "sport", "name": "Баскетбол"}]
+        payload["customFactors"][0]["factors"][0]["pt"] = "0.5"
+        result = extract_match_markets(payload, event_id=10)
+        self.assertTrue(all(m["name"] is None for m in result["markets"]))
+
     def test_unverified_goal_card_hypotheses_only_for_full_match(self):
         payload = {
             "sports": [{"id": 1, "kind": "sport", "name": "Футбол"}],
@@ -264,20 +323,19 @@ class MatchMarketTests(unittest.TestCase):
         }
         result = extract_unlabeled_pairs(payload, event_id=10)
         candidates = result["calibration_hypotheses"]
-        self.assertEqual(len(candidates), 4)
+        # Goal factors are now verified by UI screenshots and no longer
+        # presented as calibration hypotheses. Cards remain unverified.
+        self.assertEqual(len(candidates), 2)
         self.assertEqual(
             {(c["market_section"], c["hypothesized_team"]) for c in candidates},
-            {("голы", "Брентфорд"), ("голы", "Эвертон"),
-             ("желтые карты", "Брентфорд"), ("желтые карты", "Эвертон")},
+            {("желтые карты", "Брентфорд"), ("желтые карты", "Эвертон")},
         )
         self.assertTrue(all(not c["verified_for_this_market"] for c in candidates))
-        self.assertEqual(
-            next(c for c in candidates if c["market_section"] == "голы" and c["hypothesized_team"] == "Эвертон")["hypothesized_under"]["factor_id"],
-            1871,
-        )
-        # No premature promotion to confirmed market labels.
         underlying = extract_match_markets(payload, event_id=10)
-        self.assertTrue(all(m["name"] is None for m in underlying["markets"] if m["subevent_name"] in (None, "желтые карты")))
+        self.assertTrue(all(m["name"] is None for m in underlying["markets"]
+                            if m["subevent_name"] == "желтые карты"))
+        self.assertTrue(all(m["name"] is not None for m in underlying["markets"]
+                            if m["event_id"] == 10))
 
     def test_team_hypotheses_are_filtered_by_section_and_reject_other_sports(self):
         payload = {
@@ -297,6 +355,8 @@ class MatchMarketTests(unittest.TestCase):
         goals = extract_unlabeled_pairs(payload, 10, section="Матч")
         self.assertEqual(cards["calibration_hypothesis_count"], 1)
         self.assertEqual(cards["calibration_hypotheses"][0]["market_section"], "желтые карты")
+        # The test uses the wrong full-match goal threshold for factor 1809
+        # (1.5 instead of screenshot-confirmed 0.5), so it stays unverified.
         self.assertEqual(goals["calibration_hypothesis_count"], 1)
         self.assertEqual(goals["calibration_hypotheses"][0]["market_section"], "голы")
         payload["sports"] = [{"id": 1, "kind": "sport", "name": "Баскетбол"}]
