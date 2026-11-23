@@ -7,6 +7,8 @@ from typing import Any, Literal, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 
+from fonbet_mcp.summary import find_match_candidates, summarize_match_line
+
 from fonbet_mcp.config import load_settings
 from fonbet_mcp.fonbet import (
     FonbetClient,
@@ -111,6 +113,24 @@ async def get_match_markets(
         include_raw=include_raw,
         line_payload=line_payload,
     )
+
+
+@mcp.tool()
+async def get_match_line(query: str, lang: str = "ru") -> dict[str, Any]:
+    """One-call football match summary by team names: goals, corners, yellow cards.
+
+    Returns verified full-time general and individual totals with Fonbet
+    decimal odds and break-even thresholds (1/odds). No probability model,
+    recommendations, bets, unknown-factor guesses or period markets.
+    Ambiguous names return candidates instead of selecting an arbitrary event.
+    """
+    line = await client.current_line(lang=lang)
+    search = find_match_candidates(line, query)
+    if search["status"] != "found":
+        return search
+    event_id = search["event"]["event_id"]
+    payload = await client.event_view(event_id=event_id, lang=lang)
+    return summarize_match_line(event_id, payload, line)
 
 
 @mcp.tool()
