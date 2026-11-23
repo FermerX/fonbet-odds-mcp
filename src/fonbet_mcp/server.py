@@ -119,12 +119,15 @@ async def get_match_markets(
 
 @mcp.tool()
 async def get_match_line(query: str, lang: str = "ru") -> dict[str, Any]:
-    """One-call football match summary by team names: goals, corners, yellow cards.
+    """One-call football line: verified totals plus extended identified markets.
 
-    Returns verified full-time general and individual totals with Fonbet
-    decimal odds and break-even thresholds (1/odds). No probability model,
-    recommendations, bets, unknown-factor guesses or period markets.
-    Ambiguous names return candidates instead of selecting an arbitrary event.
+    market_sections preserves full-time goal/corner/card totals.
+    expanded_market_sections includes known-ID outcomes, handicaps and totals
+    from explicitly linked full-time and period football statistic events:
+    fouls, shots, shots on target, offsides, throw-ins, goal kicks, woodwork.
+    Unknown IDs remain excluded. Prices are Fonbet odds; 1/odds is a
+    break-even threshold, not an independent probability prediction.
+    Ambiguous names return candidates instead of an arbitrary match.
     """
     line = await client.current_line(lang=lang)
     search = find_match_candidates(line, query)
