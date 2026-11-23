@@ -43,10 +43,11 @@ def _scopes(claims: dict[str, Any]) -> list[str]:
 class JWKSJWTVerifier:
     """Verify provider-signed JWTs; reject expired, altered or wrong-audience tokens."""
 
-    def __init__(self, issuer: str, jwks_url: str, audience: str, required_scopes: list[str]):
+    def __init__(self, issuer: str, jwks_url: str, audience: str, required_scopes: list[str], allowed_subject: str):
         self.issuer = issuer
         self.audience = audience
         self.required_scopes = set(required_scopes)
+        self.allowed_subject = allowed_subject
         # PyJWKClient caches JWKS and signing keys, fetching via TLS. No secret
         # or client API key is stored in this server or in GitHub.
         self.jwks = PyJWKClient(
@@ -69,7 +70,7 @@ class JWKSJWTVerifier:
             if not self.required_scopes.issubset(scopes):
                 return None
             subject = claims["sub"]
-            if not isinstance(subject, str) or not subject:
+            if not isinstance(subject, str) or subject != self.allowed_subject:
                 return None
             client_id = claims.get("client_id") or claims.get("azp") or subject
             if not isinstance(client_id, str) or not client_id:
@@ -97,7 +98,7 @@ def build_auth_kwargs(environ: Mapping[str, str] | None = None) -> dict[str, Any
     if mode != "oauth":
         raise ValueError("MCP_AUTH_MODE must be 'none' or 'oauth'")
 
-    required = ("MCP_OAUTH_ISSUER", "MCP_OAUTH_RESOURCE_URL", "MCP_OAUTH_JWKS_URL")
+    required = ("MCP_OAUTH_ISSUER", "MCP_OAUTH_RESOURCE_URL", "MCP_OAUTH_JWKS_URL", "MCP_OAUTH_ALLOWED_SUBJECT")
     missing = [key for key in required if not env.get(key)]
     if missing:
         raise ValueError("OAuth is enabled but these settings are missing: " + ", ".join(missing))
@@ -108,6 +109,9 @@ def build_auth_kwargs(environ: Mapping[str, str] | None = None) -> dict[str, Any
     audience = env.get("MCP_OAUTH_AUDIENCE", resource_url).strip()
     if not audience:
         raise ValueError("MCP_OAUTH_AUDIENCE must not be empty")
+    allowed_subject = env["MCP_OAUTH_ALLOWED_SUBJECT"].strip()
+    if not allowed_subject:
+        raise ValueError("MCP_OAUTH_ALLOWED_SUBJECT must not be empty")
     scopes = env.get("MCP_OAUTH_REQUIRED_SCOPES", "fonbet:read").split()
     if not scopes:
         raise ValueError("MCP_OAUTH_REQUIRED_SCOPES must have at least one scope")
@@ -115,6 +119,7 @@ def build_auth_kwargs(environ: Mapping[str, str] | None = None) -> dict[str, Any
     verifier = JWKSJWTVerifier(
         issuer=issuer, jwks_url=jwks_url,
         audience=audience, required_scopes=scopes,
+        allowed_subject=allowed_subject,
     )
     return {
         # The verifier validates the 'aud' claim even if the identity
