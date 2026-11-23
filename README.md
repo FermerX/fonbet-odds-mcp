@@ -76,3 +76,43 @@ If you create a Web Service manually instead of Blueprint:
 
 Odds are read from `customFactors[].factors[]`; `f` is the factor id and `v` is the decimal odds value.
 
+
+## Security / optional OAuth 2.1
+
+**Until enabled, this public Render MCP endpoint remains unauthenticated.**
+It reads public Fonbet odds and has no account-login or betting tools, but
+other people can invoke the tools and consume Render capacity.
+
+ChatGPT custom MCP plugins support OAuth or no authentication, not custom
+API-key request headers. A secret in a public URL is not a reliable substitute.
+
+### Setup (only after an OAuth provider is ready)
+
+1. Configure an OAuth/OIDC authorization server supporting authorization-code
+   flow with PKCE S256, ChatGPT-compatible CIMD/DCR client onboarding, and
+   discoverable issuer metadata. Configure its allowed users and token audience.
+2. Configure access tokens as RS256/ES256 signed JWTs with JWKS, and claims
+   `iss`, `aud`, `sub`, `exp`, plus scope `fonbet:read` (in `scope` or `scp`).
+   Support refresh tokens / `offline_access` for stable ChatGPT connections.
+3. In the **Render dashboard > your service > Environment**, set:
+
+   - `MCP_AUTH_MODE=oauth`
+   - `MCP_OAUTH_ISSUER=https://EXACT-OAUTH-ISSUER`
+   - `MCP_OAUTH_JWKS_URL=https://PROVIDER-JWKS-ENDPOINT`
+   - `MCP_OAUTH_RESOURCE_URL=https://SERVICE.onrender.com/mcp`
+   - `MCP_OAUTH_AUDIENCE=https://SERVICE.onrender.com/mcp` (or provider's API audience)
+   - `MCP_OAUTH_REQUIRED_SCOPES=fonbet:read`
+
+   Do not put secret credentials in GitHub or `render.yaml`. The provider
+   must issue tokens with the same audience and scopes as the server expects.
+4. Switch your **ChatGPT > Plugins > Fonbet Odds** authentication setting
+   to OAuth / reconnect with OAuth; complete provider login and consent.
+
+**Safe rollout:** Leave `MCP_AUTH_MODE=none` (or unset) until the provider
+and ChatGPT login are ready; otherwise the existing plugin will stop working.
+For zero disruption, test using a separate protected Render service first.
+A rollback to `none` restores old access **but makes the endpoint public again**.
+
+Invalid OAuth configuration fails on startup instead of silently falling back
+to no authentication. Valid mode checks JWT signatures, issuer, audience,
+expiration and scopes. This server verifies tokens but does not issue them.

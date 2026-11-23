@@ -25,3 +25,12 @@ jobs:
         run: python -m compileall -q src tests
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+      - name: Smoke import unauthenticated server
+        run: python -c "from fonbet_mcp.server import mcp"
+      - name: Smoke import OAuth-protected server
+        env:
+          MCP_AUTH_MODE: oauth
+          MCP_OAUTH_ISSUER: https://auth.example.test
+          MCP_OAUTH_RESOURCE_URL: https://fonbet.example.test/mcp
+          MCP_OAUTH_JWKS_URL: https://auth.example.test/.well-known/jwks.json
+        run: python -c "from fonbet_mcp.server import mcp"
