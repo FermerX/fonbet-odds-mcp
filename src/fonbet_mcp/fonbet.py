@@ -237,6 +237,48 @@ def _verified_team_goal_label(
     return f"{team} {direction} голов ({verified_threshold})"
 
 
+# Fonbet UI screenshot calibration: Brentford-Everton, full-match yellow cards.
+# Confirmed all 6 factor IDs, sides, thresholds, prices and both teams.
+# Deliberately restricted to the exact full-match "желтые карты" child event;
+# it must NOT be extended to first-half cards, goals, corners or other sports.
+_VERIFIED_TEAM_YELLOW_CARD_FACTOR_IDS: dict[int, tuple[int, str, str]] = {
+    1809: (1, "ИТБ", "1.5"),
+    1810: (1, "ИТМ", "1.5"),
+    1854: (2, "ИТБ", "1.5"),
+    1871: (2, "ИТМ", "1.5"),
+    1873: (2, "ИТБ", "2.5"),
+    1874: (2, "ИТМ", "2.5"),
+}
+
+
+def _verified_team_yellow_card_label(
+    factor_id: Any,
+    param_text: Any,
+    root: dict[str, Any],
+    event: dict[str, Any],
+    event_id: int,
+    section_name: str,
+    sport_name: str | None,
+) -> str | None:
+    """Return screenshot-verified card totals only in the full-match cards child."""
+    if sport_name != "Футбол":
+        return None
+    if section_name.strip().casefold() != "желтые карты":
+        return None
+    if event.get("parentId") != event_id or not isinstance(factor_id, int):
+        return None
+    spec = _VERIFIED_TEAM_YELLOW_CARD_FACTOR_IDS.get(factor_id)
+    if spec is None:
+        return None
+    team_number, direction, threshold = spec
+    if str(param_text) != threshold:
+        return None
+    team = root.get("team1") if team_number == 1 else root.get("team2")
+    if not isinstance(team, str) or not team.strip():
+        return None
+    return f"{team} {direction} ЖК ({threshold})"
+
+
 def extract_match_markets(
     payload: dict[str, Any],
     event_id: int,
@@ -336,6 +378,17 @@ def extract_match_markets(
                     market["name"] = verified_label
                     market["label"] = verified_label
                     market["mapping_source"] = "calibrated_fonbet_ui_bre_ev_corners"
+            # Calibrated with Fonbet UI; only the direct full-match yellow-cards
+            # event, never halftime, generic goals or unrelated market sections.
+            if market.get("name") is None:
+                card_label = _verified_team_yellow_card_label(
+                    market.get("factor_id"), market.get("param_text"),
+                    root, event, event_id, section, root_sport_name,
+                )
+                if card_label:
+                    market["name"] = card_label
+                    market["label"] = card_label
+                    market["mapping_source"] = "calibrated_fonbet_ui_bre_ev_cards"
             all_markets.append(market)
 
     needle = (query or "").casefold().strip()
