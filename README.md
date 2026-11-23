@@ -69,6 +69,32 @@ If you create a Web Service manually instead of Blueprint:
 - `get_cross_match_specials` - inspect special-style markets across multiple events.
 - `fonbet_value_check` - simple value-bet check from your estimated probability.
 
+## Extended football line (opt-in branch)
+
+After deploying this branch, the existing `get_match_line("Сантос - Гремио")`
+tool preserves `market_sections` (verified full-time goal, corner and yellow-card
+totals) and adds `expanded_market_sections`, grouped by statistic and period.
+
+Additional explicitly named statistics: fouls, shots on target, offsides,
+throw-ins, goal kicks, all shots, and shots hitting the woodwork. It also lists
+known factor-ID result, double-chance and handicap selections, plus
+first-/second-half totals when the corresponding sub-event exists.
+
+**Safety/accuracy:** The new output includes only known factor IDs in matching
+root/child/grandchild football sub-events. It does not infer unknown factors
+from price, factor adjacency, or numerical parameter. Period markets are kept
+separate and returned odds are not win-probability forecasts. The
+`identification_basis` flag means an identified mapping, not fresh validation
+against the Fonbet user interface. Before placing a bet, confirm the
+selection and settlement rules in the Fonbet betslip.
+
+`expanded_market_count` and `selected_market_count` reflect extra identified
+selections. `get_match_markets` remains available for all unrecognized factors.
+No account, login, or bet-placement functionality is added.
+OAuth and deployment configuration remain unchanged.
+
+Tests: `python -m unittest discover -s tests -p 'test_expanded_summary.py'`.
+
 ## Current Fonbet endpoints
 
 - `GET /events/listBase?scopeMarket=1600&lang=ru`

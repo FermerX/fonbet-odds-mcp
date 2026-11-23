@@ -155,6 +155,156 @@ def _selection(market: dict[str, Any], category: str, event: dict[str, Any]) -> 
     }
 
 
+
+# Each key must equal a direct, explicitly named full-match football sub-event.
+# The parent chain is checked below: factor IDs alone never determine the market.
+_EXTRA_SECTION_NAMES: dict[str, str] = {
+    "угловые": "corners",
+    "желтые карты": "yellow_cards",
+    "желтые карточки": "yellow_cards",
+    "фолы": "fouls",
+    "удары в створ": "shots_on_target",
+    "офсайды": "offsides",
+    "вброс аутов": "throw_ins",
+    "удары от ворот": "goal_kicks",
+    "удары всего": "shots",
+    "штанги или перекладины": "woodwork",
+}
+_PERIOD_NAMES: dict[str, str] = {"1-й тайм": "first_half", "2-й тайм": "second_half"}
+_OUTCOME_IDS = frozenset((921, 922, 923, 924, 925, 1571))
+_HANDICAP_IDS = frozenset((927, 928))
+_BOTH_SCORE_IDS = frozenset((709, 710))
+
+
+def _identified_market_context(
+    market: dict[str, Any], events: dict[int, dict[str, Any]], root_id: int
+) -> tuple[str, str] | None:
+    """Classify only an exact root/child/grandchild path, never fuzzy text."""
+    eid = market.get("event_id")
+    if eid == root_id and market.get("subevent_name") is None:
+        return "goals", "full_time"
+    event = events.get(eid)
+    if event is None:
+        return None
+    name = str(event.get("name") or event.get("caption") or "").strip().casefold()
+    parent_id = event.get("parentId")
+    if parent_id == root_id:
+        if name in _PERIOD_NAMES:
+            return "goals", _PERIOD_NAMES[name]
+        if name in _EXTRA_SECTION_NAMES:
+            return _EXTRA_SECTION_NAMES[name], "full_time"
+        return None
+    parent = events.get(parent_id)
+    if parent is None or parent.get("parentId") != root_id:
+        return None
+    parent_name = str(parent.get("name") or parent.get("caption") or "").strip().casefold()
+    category = _EXTRA_SECTION_NAMES.get(parent_name)
+    if category is None:
+        return None
+    for prefix, period in _PERIOD_NAMES.items():
+        if name == f"{prefix} {parent_name}":
+            return category, period
+    return None
+
+
+def _expanded_identified_sections(
+    markets: list[dict[str, Any]],
+    events: dict[int, dict[str, Any]],
+    root_id: int,
+) -> tuple[dict[str, dict[str, dict[str, list[dict[str, Any]]]]], int]:
+    """Append safe, context-aware markets without re-labelling unknown factor IDs.
+
+    The old verified full-match goal/corner/card totals are retained unchanged in
+    market_sections. Only known, explicitly named factor IDs can enter this
+    secondary index. Identification does not independently validate settlement.
+    """
+    root = events.get(root_id, {})
+    result: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
+    seen: set[tuple[int, int, str]] = set()
+    for market in markets:
+        context = _identified_market_context(market, events, root_id)
+        if context is None or market.get("blocked"):
+            continue
+        category, period = context
+        factor_id = market.get("factor_id")
+        if not isinstance(factor_id, int):
+            continue
+        known_name = _KNOWN_FACTOR_NAMES.get(factor_id)
+        if known_name is None:
+            continue
+        odds = market.get("odds")
+        if isinstance(odds, bool) or not isinstance(odds, (int, float)) or not 1 < odds < float("inf"):
+            continue
+
+        threshold: str | None = None
+        kind: str
+        team: str | None = None
+        if factor_id in _TOTAL_FACTOR_IDS:
+            # Already exposed as verified full-time totals in the original response.
+            if period == "full_time" and category in _SECTIONS:
+                continue
+            kind = "total"
+        elif factor_id in _HANDICAP_IDS:
+            kind = "handicap"
+            team_num = 1 if factor_id == 927 else 2
+            possible_team = root.get(f"team{team_num}")
+            team = possible_team if isinstance(possible_team, str) and possible_team.strip() else None
+        elif factor_id in _OUTCOME_IDS:
+            kind = "outcome"
+        elif factor_id in _BOTH_SCORE_IDS and category == "goals" and period == "full_time":
+            kind = "both_teams_score"
+        else:
+            continue
+
+        if kind in ("total", "handicap"):
+            raw_threshold = market.get("param_text")
+            if raw_threshold in (None, ""):
+                continue
+            threshold = str(raw_threshold)
+            try:
+                numeric = float(threshold.replace(",", "."))
+            except ValueError:
+                continue
+            if not float("-inf") < numeric < float("inf") or (kind == "total" and numeric < 0):
+                continue
+            expected_name = f"{known_name} ({threshold})"
+            if market.get("name") != expected_name:
+                continue
+        elif market.get("name") != known_name or market.get("param_text") not in (None, ""):
+            continue
+
+        dedupe_key = (market["event_id"], factor_id, threshold or "")
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        entry: dict[str, Any] = {
+            "event_id": market["event_id"],
+            "factor_id": factor_id,
+            "category": category,
+            "period": period,
+            "kind": kind,
+            "label": known_name if threshold is None else f"{known_name} ({threshold})",
+            "odds": odds,
+            "break_even_percent": round(100 / odds, 2),
+            "identification_basis": "known_factor_id_and_explicit_event_path",
+        }
+        if threshold is not None:
+            entry["threshold"] = threshold
+        if team is not None:
+            entry["team"] = team
+
+        period_buckets = result.setdefault(category, {}).setdefault(period, {})
+        period_buckets.setdefault(kind, []).append(entry)
+
+    for periods in result.values():
+        for buckets in periods.values():
+            for entries in buckets.values():
+                entries.sort(key=lambda item: (
+                    item.get("threshold", ""),
+                    item["factor_id"],
+                ))
+    return result, len(seen)
+
 def summarize_match_line(
     event_id: int,
     event_view_payload: dict[str, Any],
@@ -210,6 +360,7 @@ def summarize_match_line(
                 0 if x["direction"] == "over" else 1,
                 x["factor_id"],
             ))
+    expanded, expanded_count = _expanded_identified_sections(all_markets, events, event_id)
     return {
         "status": "ok",
         "event": {
@@ -218,10 +369,14 @@ def summarize_match_line(
             "team2": root.get("team2"),
         },
         "market_sections": result,
+        "expanded_market_sections": expanded,
+        "expanded_market_count": expanded_count,
         "source_market_count": first_page["total_market_count"],
-        "selected_market_count": len(seen),
-        "excluded_market_count": first_page["total_market_count"] - len(seen),
-        "scope": "Full-match verified general and individual totals only; excludes periods and unknown markets.",
+        "selected_market_count": len(seen) + expanded_count,
+        "excluded_market_count": first_page["total_market_count"] - len(seen) - expanded_count,
+        "scope": ("Verified full-match goal/corner/card totals in market_sections; "
+                  "known factor IDs in explicitly linked full-match and period "
+                  "events in expanded_market_sections. Unknown IDs excluded."),
         "probability_note": (
             "break_even_probability = 1 / decimal odds. This is the break-even "
             "threshold, NOT an independent prediction of outcome probability."
