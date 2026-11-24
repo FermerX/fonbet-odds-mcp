@@ -88,7 +88,11 @@ def summarize_form(
             if played.tzinfo is None:
                 raise ValueError("Naive kickoff")
             played = played.astimezone(timezone.utc)
-            if played >= as_of:
+            # A historical FINISHED flag reflects the current API state, not
+            # the match status at an earlier as_of. Apply a conservative
+            # four-hour embargo to avoid leaking in-progress/final scores into
+            # pre-match backtests (including matches with extra time).
+            if played + timedelta(hours=4) >= as_of:
                 continue
             home = match["homeTeam"]
             away = match["awayTeam"]
