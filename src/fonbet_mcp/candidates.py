@@ -751,15 +751,15 @@ def _superseded(
 def _quote_status(client: FonbetClient, state: SearchState, quote: Quote, scan_revision: int | None) -> str:
     if quote.match_start <= datetime.now(timezone.utc).timestamp():
         return "started"
+    tick = asyncio.get_running_loop().time()
+    detail_age = tick - quote.detail_effective_tick
+    line_age = tick - quote.line_effective_tick
+    policy = client.policy
+    if max(detail_age, line_age) >= policy.max_snapshot_age:
+        return "stale"
     if _superseded(client, state, quote.row["event_id"], quote.line_tick, quote.detail_tick):
         return "superseded"
-    tick = asyncio.get_running_loop().time()
-    policy = client.policy
-    if quote.revision == scan_revision:
-        return "snapshot" if tick - quote.detail_effective_tick < policy.max_snapshot_age else "stale"
-    detail_ttl = min(policy.event_ttl, policy.max_snapshot_age)
-    line_ttl = min(policy.line_ttl, policy.max_snapshot_age)
-    if tick - quote.detail_effective_tick >= detail_ttl or tick - quote.line_effective_tick >= line_ttl:
+    if quote.revision != scan_revision and (detail_age >= policy.event_ttl or line_age >= policy.line_ttl):
         return "stale"
     return "snapshot"
 

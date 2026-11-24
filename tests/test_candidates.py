@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import time
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import httpx
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from fonbet_mcp import server
-from fonbet_mcp.candidates import search_candidates
-from fonbet_mcp.client import FonbetClient, RequestPolicy
+from fonbet_mcp.candidates import _page, search_candidates
+from fonbet_mcp.client import FonbetClient, RequestPolicy, Snapshot
+from fonbet_mcp.search_state import Quote
 
 
 SPORTS = [
@@ -381,6 +383,131 @@ class CandidateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["total_candidates"], 1)
         self.assertEqual(result["skipped_events"], 1)
         self.assertEqual(result["errors"][0]["code"], "scan_deadline")
+
+    async def test_current_revision_uses_both_effective_ages_at_the_snapshot_limit(self):
+        client = self.client()
+        loop = asyncio.get_running_loop()
+        tick = 1000.0
+        receipt = datetime.now(timezone.utc)
+        state = client.searches.create((4, 1.4, 1.6, frozenset(), "ru"), self.now)
+
+        for line_age, detail_age, expected in (
+            (59.9, 59.9, "snapshot"),
+            (60.0, 59.9, "stale"),
+            (60.1, 59.0, "stale"),
+            (59.0, 60.1, "stale"),
+            (60.1, 60.2, "stale"),
+        ):
+            with self.subTest(line_age=line_age, detail_age=detail_age):
+                line = Snapshot({}, receipt, tick - line_age + 5, upstream_age=5)
+                detail = Snapshot({}, receipt, tick - detail_age + 7, upstream_age=7)
+                state.rows[:] = [Quote(
+                    {"event_id": 10, "market_event_id": 10, "factor_id": 921,
+                     "threshold": None, "odds": 1.5, "received_at": receipt.isoformat()},
+                    self.match["startTime"], detail.received_tick, detail.effective_tick,
+                    line.received_tick, line.effective_tick, state.revision + 1,
+                )]
+                state.publish({"errors": [], "status": "ok", "partial": False, "scan_diagnostics": {}})
+                with patch.object(loop, "time", return_value=tick):
+                    result = await _page(
+                        client, state, state.revisions[state.revision], state.revision,
+                        limit=1, offset=0, own_scan=False, joined=True, refresh=False,
+                    )
+                quote = result["candidates"][0]
+                self.assertEqual(quote["quote_status"], expected)
+                self.assertEqual(quote["odds"], 1.5 if expected == "snapshot" else None)
+                self.assertEqual(quote["received_at"], receipt.isoformat())
+                self.assertEqual(result["partial"], expected == "stale")
+
+    async def test_deadline_stales_parallel_first_pages_and_preserves_resume_and_refresh(self):
+        other = fixture(11, self.now + 1200)
+        self.line["events"].append(other)
+        self.details[10] = details(self.match, block(10, factor(921), factor(923)))
+        self.details[11] = details(other, block(11, factor(921)))
+        slow_started, release = asyncio.Event(), asyncio.Event()
+
+        async def handler(request):
+            event_id = request.url.params.get("eventId")
+            if event_id == "11":
+                slow_started.set()
+                await release.wait()
+            response = await self.http(request)
+            if event_id is None and self.requests.count((None, "ru")) == 1:
+                response.headers["Age"] = "5"
+            return response
+
+        client = self.client(handler, max_concurrency=1)
+        loop = asyncio.get_running_loop()
+        real_time = loop.time
+        advance = 0
+        with (
+            patch.object(loop, "time", new=lambda: real_time() + advance),
+            patch.object(loop, "slow_callback_duration", float("inf")),
+        ):
+            owner = asyncio.create_task(self.search(client, limit=1))
+            await asyncio.wait_for(slow_started.wait(), 1)
+            waiter = asyncio.create_task(self.search(client, limit=1))
+            await asyncio.sleep(0)
+            advance = 55
+            first, joined = await asyncio.gather(owner, waiter)
+
+            self.assertEqual(first["search_id"], joined["search_id"])
+            self.assertEqual(joined["diagnostics"]["search_coalesced"], 1)
+            self.assertEqual(first["search_status"], "paused")
+            self.assertEqual(first["remaining_matches"], 1)
+            for page in (first, joined):
+                self.assertEqual({error["code"] for error in page["errors"]}, {"scan_deadline", "quote_stale"})
+                self.assertEqual(page["candidates"][0]["quote_status"], "stale")
+                self.assertIsNone(page["candidates"][0]["odds"])
+                self.assertLess(page["candidates"][0]["quote_age_seconds"], 60)
+
+            cursor = first["next_cursor"]
+            old = await self.search(client, cursor=cursor)
+            release.set()
+            resumed = await self.search(client, search_id=first["search_id"], resume=True)
+            self.assertEqual(resumed["search_id"], first["search_id"])
+            self.assertEqual(resumed["revision"], first["revision"] + 1)
+            self.assertEqual(resumed["window_end"], first["window_end"])
+            self.assertEqual(resumed["search_status"], "complete")
+            self.assertEqual(resumed["remaining_matches"], 0)
+            self.assertEqual(resumed["matches_completed"], 2)
+            self.assertIsNone(resumed["candidates"][0]["odds"])
+            self.assertEqual(resumed["candidates"][-1]["quote_status"], "snapshot")
+            self.assertEqual(resumed["candidates"][-1]["odds"], 1.5)
+            self.assertEqual(self.requests, [(None, "ru"), (10, "ru"), (11, "ru"), (None, "ru")])
+
+            refreshed = await self.search(client, cursor=cursor, refresh=True)
+            self.assertEqual(refreshed["revision"], old["revision"])
+            self.assertEqual(refreshed["remaining_matches"], 1)
+            quote, stored = refreshed["candidates"][0], old["candidates"][0]
+            self.assertEqual(quote["factor_id"], stored["factor_id"])
+            self.assertEqual(quote["received_at"], stored["received_at"])
+            self.assertEqual(quote["quote_status"], "verified")
+            self.assertEqual(quote["odds"], 1.5)
+            self.assertGreater(quote["verified_at"], stored["received_at"])
+            self.assertEqual(self.requests[-1], (10, "ru"))
+            self.assertEqual(self.requests.count((11, "ru")), 1)
+
+    async def test_refresh_suppresses_odds_if_either_source_returns_an_expired_age(self):
+        expired_source = None
+
+        async def handler(request):
+            response = await self.http(request)
+            is_line = request.url.params.get("eventId") is None
+            if expired_source == ("line" if is_line else "detail"):
+                response.headers["Age"] = "60"
+            return response
+
+        client = self.client(handler, line_ttl=0, event_ttl=0)
+        first = await self.search(client)
+        self.assertEqual(first["candidates"][0]["odds"], 1.5)
+
+        for expired_source, expected_error in (("line", "refresh_deadline"), ("detail", "stale_snapshot")):
+            with self.subTest(expired_source=expired_source):
+                refreshed = await self.search(client, search_id=first["search_id"], refresh=True)
+                self.assertIsNone(refreshed["candidates"][0]["odds"])
+                self.assertNotIn(refreshed["candidates"][0]["quote_status"], ("snapshot", "verified"))
+                self.assertIn(expected_error, {error["code"] for error in refreshed["errors"]})
 
     async def test_cursor_and_offset_reuse_frozen_results_with_no_http(self):
         self.details[10] = details(self.match, block(10, factor(930, threshold="2.5"), factor(931, threshold="2.5")))
