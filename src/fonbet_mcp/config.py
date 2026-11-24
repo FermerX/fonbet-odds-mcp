@@ -36,5 +36,7 @@ def load_settings() -> Settings:
             retries=int(os.getenv("FONBET_RETRIES", "2")),
             max_retry_delay=float(os.getenv("FONBET_MAX_RETRY_DELAY", "5")),
             max_snapshot_age=float(os.getenv("FONBET_MAX_SNAPSHOT_AGE", "60")),
+            max_inflight_requests=int(os.getenv("FONBET_MAX_INFLIGHT_REQUESTS", "32")),
+            max_concurrent_searches=int(os.getenv("FONBET_MAX_CONCURRENT_SEARCHES", "2")),
         ),
     )

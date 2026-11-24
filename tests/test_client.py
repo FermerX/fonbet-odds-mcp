@@ -8,7 +8,9 @@ from email.utils import format_datetime
 
 import httpx
 
-from fonbet_mcp.client import FonbetClient, FonbetCooldownError, RequestPolicy, _retry_after
+from fonbet_mcp.client import (
+    FonbetClient, FonbetCooldownError, FonbetRequestCapacityError, RequestPolicy, _retry_after,
+)
 
 
 class FonbetClientTests(unittest.IsolatedAsyncioTestCase):
@@ -84,6 +86,34 @@ class FonbetClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(snapshot is snapshots[0] for snapshot in snapshots))
         await client.current_line()
         self.assertEqual(count, 2)
+
+    async def test_unique_request_limit_includes_queue_and_still_coalesces(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def handler(request):
+            event_id = int(request.url.params["eventId"])
+            calls.append(event_id)
+            started.set()
+            await release.wait()
+            return httpx.Response(200, json={"event": event_id})
+
+        client = self.make_client(handler, max_concurrency=1, max_inflight_requests=2)
+        first = asyncio.create_task(client.event_view_snapshot(1))
+        await asyncio.wait_for(started.wait(), 1)
+        queued = asyncio.create_task(client.event_view_snapshot(2))
+        await asyncio.sleep(0)
+        duplicate = asyncio.create_task(client.event_view_snapshot(2))
+        try:
+            with self.assertRaises(FonbetRequestCapacityError):
+                await client.event_view(3)
+            self.assertEqual(calls, [1])
+        finally:
+            release.set()
+        _, queued_snapshot, coalesced = await asyncio.gather(first, queued, duplicate)
+        self.assertIs(queued_snapshot, coalesced)
+        self.assertEqual((await client.event_view(3))["event"], 3)
+        self.assertEqual(calls, [1, 2, 3])
 
     async def test_rate_limit_and_concurrency_apply_to_distinct_requests(self):
         loop = asyncio.get_running_loop()

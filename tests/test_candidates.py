@@ -84,8 +84,11 @@ class CandidateTests(unittest.IsolatedAsyncioTestCase):
         ])
         result = await self.search()
         self.assertEqual(self.requests, [(None, "ru"), (10, "ru")])
+        self.assertEqual(result["root_events"], 6)
+        self.assertEqual(result["eligible_matches"], 1)
         self.assertEqual(result["skipped_events"], 5)
         self.assertEqual(result["matches_checked"], 1)
+        self.assertEqual(result["matches_completed"], 1)
         self.assertEqual(result["candidates"][0]["event_id"], 10)
 
     async def test_inclusive_odds_and_valid_prices(self):
@@ -151,7 +154,9 @@ class CandidateTests(unittest.IsolatedAsyncioTestCase):
         self.details[10]["factorTypes"] = [{"factorId": 9999, "name": "П1"}]
         result = await self.search()
         self.assertEqual(result["candidates"], [])
-        self.assertFalse(result["partial"])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["invalid_market_rows"], 1)
+        self.assertEqual(result["conflicting_markets"], 1)
 
     async def test_event_block_index_filters_whole_events_and_individual_factors(self):
         self.line["events"].append(fixture(11, self.now + 1200))
@@ -223,12 +228,116 @@ class CandidateTests(unittest.IsolatedAsyncioTestCase):
         result = await self.search()
         self.assertTrue(result["partial"])
         self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["eligible_matches"], 3)
         self.assertEqual(result["matches_checked"], 3)
+        self.assertEqual(result["matches_completed"], 1)
         self.assertEqual(result["skipped_events"], 2)
         self.assertEqual(result["error_count"], 2)
         self.assertEqual(result["errors"][0]["http_status"], 503)
         self.assertEqual(result["errors"][1]["code"], "invalid_response")
         self.assertEqual(result["total_candidates"], 1)
+
+    async def test_conflicting_semantic_aliases_are_excluded_before_filters(self):
+        self.details[10] = details(self.match, block(
+            10, factor(930, 1.5, "2.5"), factor(1727, 1.7, "2,5"),
+            factor(931, 1.5, "2.5"), factor(930, 1.6, "2.50"),
+        ))
+        client = self.client()
+        for minimum, maximum, expected in ((1.4, 1.6, 1), (1.6, 1.8, 0)):
+            result = await self.search(client, min_odds=minimum, max_odds=maximum)
+            self.assertEqual(result["total_candidates"], expected)
+            self.assertTrue(all(row["side"] == "under" for row in result["candidates"]))
+            self.assertEqual(result["conflicting_markets"], 1)
+            self.assertEqual(result["errors"][0]["code"], "conflicting_quotes")
+            self.assertEqual(result["markets_processed"], 4)
+
+    async def test_calibrated_threshold_spelling_and_zero_handicap_alias(self):
+        self.details[10] = details(self.match, block(
+            10, factor(1812, 1.5, "1.0"), factor(1812, 1.5, "1"),
+            factor(927, 1.5, "-0"), factor(2820, 1.6, "0,0"),
+        ))
+        result = await self.search()
+        self.assertEqual([row["factor_id"] for row in result["candidates"]], [1812])
+        self.assertEqual(result["conflicting_markets"], 1)
+        self.assertEqual(result["invalid_market_rows"], 0)
+
+    async def test_unsupported_text_parameters_are_not_malformed_total_rows(self):
+        self.details[10] = details(self.match, block(
+            10, factor(1888, 10, "1:0"), factor(589, 5, "1 и менее"), factor(921),
+        ))
+        result = await self.search()
+        self.assertFalse(result["partial"])
+        self.assertEqual((result["markets_processed"], result["invalid_market_rows"]), (3, 0))
+        self.assertEqual([row["factor_id"] for row in result["candidates"]], [921])
+
+    async def test_malformed_lines_return_structured_error(self):
+        for broken in ({"events": [self.match], "sports": []},
+                       {"events": [self.match], "sports": [{"id": []}]},
+                       {**self.line, "events": [{**self.match, "sportId": []}]},
+                       {**self.line, "events": [self.match, {**self.match, "place": "live"}]},
+                       {**self.line, "eventBlocks": [{"eventId": 10, "state": "partial", "factors": [{}]}]}):
+            with self.subTest(broken=broken):
+                self.line = broken
+                result = await self.search()
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["errors"][0]["code"], "invalid_response")
+                self.assertEqual(result["matches_checked"], 0)
+
+    async def test_malformed_details_preserve_other_matches_and_valid_rows(self):
+        other = fixture(11, self.now + 1500)
+        self.line["events"].extend([other, self.match])
+        self.details[10] = details(self.match, block(
+            10, None, factor(930, 1.5, "1e9999"), factor(921, 10 ** 400), factor(923),
+        ), {"e": 10, "factors": None})
+        self.details[11] = details({**other, "parentId": []}, block(11, factor(921)))
+        result = await self.search()
+        self.assertEqual((result["root_events"], result["eligible_matches"]), (2, 2))
+        self.assertEqual((result["matches_checked"], result["matches_completed"]), (2, 1))
+        self.assertEqual((result["skipped_events"], result["markets_processed"]), (1, 4))
+        self.assertEqual(result["invalid_market_rows"], 3)
+        self.assertEqual([row["factor_id"] for row in result["candidates"]], [923])
+        self.assertEqual({issue["code"] for issue in result["errors"]},
+                         {"incomplete_detail", "invalid_market_rows", "invalid_response"})
+
+    async def test_horizon_limits_are_checked_before_fetching(self):
+        for invalid in (0, -1, 12.1, float("inf"), float("nan")):
+            with self.subTest(hours=invalid), self.assertRaisesRegex(ValueError, "at most 12"):
+                await self.search(hours_ahead=invalid)
+        self.assertEqual(self.requests, [])
+        self.assertEqual((await self.search(hours_ahead=12))["status"], "ok")
+
+    async def test_search_capacity_releases_on_cancellation(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def handler(request):
+            if "eventId" not in request.url.params:
+                started.set()
+                await release.wait()
+            return await self.http(request)
+
+        client = self.client(handler, max_concurrent_searches=1)
+        first = asyncio.create_task(self.search(client))
+        await asyncio.wait_for(started.wait(), 1)
+        overloaded = await self.search(client)
+        self.assertEqual(overloaded["status"], "error")
+        self.assertEqual(overloaded["errors"][0]["code"], "search_capacity")
+        self.assertEqual(overloaded["matches_checked"], 0)
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        release.set()
+        fresh = await self.search(client)
+        self.assertEqual(fresh["status"], "ok")
+        self.assertEqual(self.requests, [(None, "ru"), (10, "ru")])
+
+    async def test_detail_queue_rejection_does_not_inflate_checked_count(self):
+        other = fixture(11, self.now + 1500)
+        self.line["events"].append(other)
+        self.details[11] = details(other, block(11, factor(921)))
+        result = await self.search(self.client(max_inflight_requests=1, max_concurrency=2))
+        self.assertEqual((result["eligible_matches"], result["matches_checked"]), (2, 1))
+        self.assertEqual((result["matches_completed"], result["skipped_events"]), (1, 1))
+        self.assertEqual(result["errors"][0]["code"], "request_capacity")
 
     async def test_line_failure_is_distinct_from_empty_line(self):
         self.line = 429

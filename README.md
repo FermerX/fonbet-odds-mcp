@@ -91,7 +91,8 @@ Call `fonbet_find_candidates` with these MCP tool arguments:
 
 An empty argument object uses a four-hour window, the inclusive odds range 1.40–1.60,
 all identified categories, a page of 50, and Russian. The window starts at the
-time of the call. `limit` accepts 1–500 and `offset` starts at zero.
+time of the call. `hours_ahead` accepts values greater than zero and up to 12 hours.
+`limit` accepts 1–500 and `offset` starts at zero.
 The tool sorts by kickoff, event ID, market event ID, factor ID and threshold.
 Pass `next_offset` to fetch the next page with the same filters. Each page
 checks the current line, so market changes or kickoffs can move entries between
@@ -114,10 +115,20 @@ limit includes the HTTP `Age` header when the upstream sends it. Odds come from
 the event detail response. A timeout or upstream error can leave a partial
 page, with `partial: true` and structured `errors`. A failed line request
 returns `status: "error"`. An empty valid line returns `status: "ok"`.
-`matches_checked` counts started detail checks, `markets_processed` counts
-factor rows examined before odds and category filters, and `skipped_events`
-counts root events excluded from the scan or omitted after a failed or incomplete
-check. `total_candidates` counts selections before pagination.
+`root_events` counts distinct root events in the line. `eligible_matches` counts
+prematch football fixtures in the requested window. `matches_checked` counts
+admitted detail checks, including checks that fail or run out of time.
+`matches_completed` counts fixtures with fresh, processed details, including
+usable parts of incomplete responses. `skipped_events` is the difference
+between `root_events` and `matches_completed`. `markets_processed` counts all
+factor rows examined in eligible detail blocks, including invalid rows
+(`invalid_market_rows`) and duplicates. `total_candidates` counts selections
+before pagination. Identified aliases at equal prices count once. Conflicting
+prices for the same selection suppress that selection before applying the odds
+filter and increment `conflicting_markets`.
+
+At capacity, the tool reports `search_capacity` for a refused scan or
+`request_capacity` when an upstream detail check cannot be queued.
 
 `threshold_is_integer` distinguishes whole from fractional parameters.
 Settlement details such as refunds, quarter-line splits, and extra time require
@@ -134,12 +145,15 @@ probability or return forecast.
 | `FONBET_EVENT_CACHE_SIZE` | 256 | Maximum cached event responses |
 | `FONBET_REQUESTS_PER_SECOND` | 5 | Maximum outbound request start rate per server process |
 | `FONBET_MAX_CONCURRENCY` | 4 | Maximum concurrent upstream requests per server process |
+| `FONBET_MAX_INFLIGHT_REQUESTS` | 32 | Maximum distinct upstream requests active, queued, or waiting to retry per server process |
+| `FONBET_MAX_CONCURRENT_SEARCHES` | 2 | Maximum simultaneous candidate scans per server process |
 | `FONBET_RETRIES` | 2 | Additional attempts on network errors, timeouts, HTTP 429, and HTTP 500/502/503/504 |
 | `FONBET_MAX_RETRY_DELAY` | 5 | Maximum retry wait, in seconds |
 | `FONBET_MAX_SNAPSHOT_AGE` | 60 | Maximum snapshot age and scan deadline, measured from receipt of the line |
 
 Set either TTL or cache size to zero to disable reuse for that cache. Concurrent
-identical requests share one upstream operation. A longer upstream
+identical requests share one upstream operation. All MCP sessions served by the
+same process share the client, caches and rate limits. A longer upstream
 `Retry-After` pauses new upstream requests and returns a visible error to the
 caller. Expired cache entries are never used as a fallback.
 

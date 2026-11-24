@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import math
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -23,6 +25,8 @@ class RequestPolicy:
     retries: int = 2
     max_retry_delay: float = 5
     max_snapshot_age: float = 60
+    max_inflight_requests: int = 32
+    max_concurrent_searches: int = 2
 
     def __post_init__(self) -> None:
         nonnegative = (self.line_ttl, self.event_ttl, self.max_retry_delay)
@@ -31,8 +35,10 @@ class RequestPolicy:
             raise ValueError("Fonbet cache TTLs and retry delay must be finite and nonnegative")
         if any(not math.isfinite(value) or value <= 0 for value in positive):
             raise ValueError("Fonbet request rate and snapshot age must be finite and positive")
-        if min(self.line_cache_size, self.event_cache_size, self.retries) < 0 or self.max_concurrency < 1:
-            raise ValueError("Invalid Fonbet cache size, retry count or concurrency")
+        if min(self.line_cache_size, self.event_cache_size, self.retries) < 0:
+            raise ValueError("Invalid Fonbet cache size or retry count")
+        if min(self.max_concurrency, self.max_inflight_requests, self.max_concurrent_searches) < 1:
+            raise ValueError("Fonbet concurrency and request limits must be positive")
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,14 @@ class Snapshot:
 
 class FonbetCooldownError(RuntimeError):
     """The upstream asked for a pause longer than a single retry can wait."""
+
+
+class FonbetRequestCapacityError(RuntimeError):
+    """The client reached its limit of active and queued unique requests."""
+
+
+class FonbetSearchCapacityError(RuntimeError):
+    """The application reached its limit of simultaneous candidate scans."""
 
 
 class FonbetClient:
@@ -84,6 +98,17 @@ class FonbetClient:
         self._rate_lock = asyncio.Lock()
         self._next_request = 0.0
         self._retry_until = 0.0
+        self._active_searches = 0
+
+    @contextmanager
+    def candidate_search_slot(self) -> Iterator[None]:
+        if self._active_searches >= self.policy.max_concurrent_searches:
+            raise FonbetSearchCapacityError("Fonbet candidate search is busy")
+        self._active_searches += 1
+        try:
+            yield
+        finally:
+            self._active_searches -= 1
 
     async def aclose(self) -> None:
         tasks = tuple(self._inflight.values())
@@ -133,6 +158,9 @@ class FonbetClient:
         request_key = (kind, key)
         task = self._inflight.get(request_key)
         if task is None:
+            if len(self._inflight) >= self.policy.max_inflight_requests:
+                raise FonbetRequestCapacityError("Fonbet request queue is full")
+
             async def fetch() -> Snapshot:
                 try:
                     snapshot = await self._get(path, params)

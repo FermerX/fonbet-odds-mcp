@@ -4,15 +4,34 @@ from __future__ import annotations
 import asyncio
 import math
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from sys import float_info
 from typing import Any
 
 import httpx
 
-from fonbet_mcp.client import FonbetClient, FonbetCooldownError, Snapshot
-from fonbet_mcp.fonbet import _iter_events, _sport_name, _sports_by_id
-from fonbet_mcp.summary import _EXTRA_SECTION_NAMES, summarize_match_line
+from fonbet_mcp.client import (
+    FonbetClient,
+    FonbetCooldownError,
+    FonbetRequestCapacityError,
+    FonbetSearchCapacityError,
+    Snapshot,
+)
+from fonbet_mcp.fonbet import (
+    _KNOWN_FACTOR_NAMES,
+    _VERIFIED_TEAM_CORNER_FACTOR_IDS,
+    _VERIFIED_TEAM_GOAL_FACTOR_IDS,
+    _VERIFIED_TEAM_YELLOW_CARD_FACTOR_IDS,
+    _sport_name,
+)
+from fonbet_mcp.summary import _EXTRA_SECTION_NAMES, _ZERO_HANDICAP_TEAMS, summarize_match_line
+
+MAX_HOURS_AHEAD = 12
+_RECOVERABLE = (httpx.HTTPError, FonbetCooldownError, FonbetRequestCapacityError, ValueError)
+_FactorKey = tuple[int, int, Decimal | None]
+_SelectionKey = tuple[str, str, str, str, Decimal | None, int | None]
 
 _PREMATCH = {"line", "prematch", "pre_match"}
 _UNAVAILABLE = {"live", "inplay", "in_play", "started", "finished", "ended",
@@ -23,6 +42,12 @@ _SIDES = {
     925: "draw_or_team2", 1571: "team1_or_team2", 927: "team1", 928: "team2",
     2820: "team1", 2821: "team2", 709: "yes", 710: "no",
 }
+_SUPPORTED_FACTORS = (
+    _KNOWN_FACTOR_NAMES.keys()
+    | _VERIFIED_TEAM_CORNER_FACTOR_IDS.keys()
+    | _VERIFIED_TEAM_GOAL_FACTOR_IDS.keys()
+    | _VERIFIED_TEAM_YELLOW_CARD_FACTOR_IDS.keys()
+)
 _DOUBLE_CHANCES = {924, 925, 1571}
 _STATISTICS = {"goals", *_EXTRA_SECTION_NAMES.values()}
 _MARKETS = _STATISTICS | {
@@ -38,7 +63,7 @@ def _number(value: Any) -> Decimal | None:
         number = Decimal(str(value).replace(",", "."))
     except InvalidOperation:
         return None
-    return number if number.is_finite() else None
+    return number if number.is_finite() and math.isfinite(float(number)) else None
 
 
 def _unavailable(item: dict[str, Any]) -> bool:
@@ -57,11 +82,36 @@ def _prematch(event: dict[str, Any]) -> bool:
     return isinstance(stage, str) and stage.casefold() in _PREMATCH and not _unavailable(event)
 
 
-def _by_id(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
-    return {
-        event["id"]: event for event in _iter_events(payload)
-        if type(event.get("id")) is int and event["id"] > 0
-    }
+def _snapshot_index(payload: dict[str, Any], key: str) -> dict[int, dict[str, Any]]:
+    rows = payload.get(key)
+    if not isinstance(rows, list):
+        raise ValueError(f"Missing Fonbet {key} list")
+    indexed: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0:
+            raise ValueError(f"Invalid Fonbet {key} identifier")
+        for field_name in ("parentId", "sportId", "startTime"):
+            value = row.get(field_name)
+            if value is not None and type(value) is not int:
+                raise ValueError(f"Invalid Fonbet {key} {field_name}")
+        for field_name in ("name", "team1", "team2", "place"):
+            value = row.get(field_name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Invalid Fonbet {key} {field_name}")
+        previous = indexed.setdefault(row["id"], row)
+        if previous != row:
+            raise ValueError(f"Conflicting Fonbet {key} for the same ID")
+    return indexed
+
+
+def _line_indexes(payload: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+    if payload.get("fromVersion", 0) != 0:
+        raise ValueError("Expected a full Fonbet line snapshot")
+    events = _snapshot_index(payload, "events")
+    sports = _snapshot_index(payload, "sports") if events or "sports" in payload else {}
+    if events and not sports:
+        raise ValueError("Fonbet line has events without sports")
+    return events, sports
 
 
 def _children(events: dict[int, dict[str, Any]]) -> dict[int, list[int]]:
@@ -87,77 +137,108 @@ def _feed_blocks(payload: dict[str, Any]) -> dict[int, set[int] | None]:
         raise ValueError("Invalid Fonbet availability data")
     for item in event_blocks:
         if not isinstance(item, dict) or type(item.get("eventId")) is not int:
-            continue
+            raise ValueError("Invalid Fonbet event block")
         event_id = item["eventId"]
-        if item.get("state") == "partial" and isinstance(item.get("factors"), list):
+        if item.get("state") == "partial":
+            blocked_ids = item.get("factors")
+            if not isinstance(blocked_ids, list) or any(type(value) is not int for value in blocked_ids):
+                raise ValueError("Invalid Fonbet partial event block")
             factors = blocked.setdefault(event_id, set())
             if factors is not None:
-                factors.update(factor_id for factor_id in item["factors"] if type(factor_id) is int)
+                factors.update(blocked_ids)
         else:
             blocked[event_id] = None
     for item in live_events:
-        if isinstance(item, dict) and type(item.get("eventId")) is int:
-            blocked[item["eventId"]] = None
+        if not isinstance(item, dict) or type(item.get("eventId")) is not int:
+            raise ValueError("Invalid Fonbet live event metadata")
+        blocked[item["eventId"]] = None
     return blocked
+
+
+@dataclass
+class MarketRows:
+    blocks: list[dict[str, Any]] = field(default_factory=list)
+    processed: int = 0
+    invalid: int = 0
+    incomplete: bool = False
+    price_conflicts: set[_FactorKey] = field(default_factory=set)
 
 
 def _market_rows(
     payload: dict[str, Any], eligible: set[int],
     line_blocks: dict[int, set[int] | None], detail_blocks: dict[int, set[int] | None],
-) -> tuple[list[dict[str, Any]], int, bool]:
-    rows: dict[int, dict[tuple[int, Decimal | None], dict[str, Any] | None]] = defaultdict(dict)
-    count = 0
-    incomplete = False
+) -> MarketRows:
+    rows = MarketRows()
+    selections: dict[_FactorKey, dict[str, dict[str, Any]]] = {}
+    unavailable: set[_FactorKey] = set()
     for block in payload["customFactors"]:
-        if not isinstance(block, dict) or type(block.get("e")) is not int or block["e"] not in eligible:
+        if not isinstance(block, dict) or type(block.get("e")) is not int or block["e"] <= 0:
+            rows.incomplete = True
+            continue
+        event_id = block["e"]
+        if event_id not in eligible:
             continue
         factors = block.get("factors")
         if not isinstance(factors, list):
-            raise ValueError("Invalid Fonbet factor list")
-        event_id = block["e"]
-        selections = rows[event_id]
+            rows.incomplete = True
+            continue
         suppressed = (line_blocks.get(event_id) or set()) | (detail_blocks.get(event_id) or set())
-        declared_count = block.get("countAll")
-        if type(declared_count) is int and declared_count > len(factors):
-            incomplete = True
+        declared_count = block.get("countAll", len(factors))
+        if type(declared_count) is not int or declared_count < 0 or declared_count > len(factors):
+            rows.incomplete = True
+
         for factor in factors:
-            count += 1
-            if not isinstance(factor, dict) or type(factor.get("f")) is not int:
+            rows.processed += 1
+            if not isinstance(factor, dict) or type(factor.get("f")) is not int or factor["f"] <= 0:
+                rows.invalid += 1
                 continue
-            param = factor.get("pt")
-            threshold = _number(param)
-            if param not in (None, "") and threshold is None:
+            factor_id = factor["f"]
+            if factor_id not in _SUPPORTED_FACTORS:
                 continue
-            key = (factor["f"], threshold)
+            raw_threshold = factor.get("pt")
+            threshold = _number(raw_threshold)
+            if raw_threshold not in (None, "") and threshold is None:
+                rows.invalid += 1
+                continue
+            if factor_id in _ZERO_HANDICAP_TEAMS:
+                if threshold not in (None, 0):
+                    rows.invalid += 1
+                    continue
+                threshold = Decimal(0)
+                factor = {**factor, "pt": "0"}
+            key = (event_id, factor_id, threshold)
+            if factor_id in suppressed or _unavailable(block) or _unavailable(factor):
+                unavailable.add(key)
+                continue
             odds = factor.get("v")
-            available = (
-                factor["f"] not in suppressed and not _unavailable(block) and not _unavailable(factor)
-                and type(odds) in (float, int) and 1 < odds < float("inf")
-            )
-            if not available:
-                selections[key] = None
-            elif key not in selections:
-                selections[key] = factor
-            elif selections[key] is not None and selections[key]["v"] != odds:
-                # Conflicting prices for the same factor and threshold are ambiguous.
-                selections[key] = None
-    return [
-        {"e": event_id, "factors": [factor for factor in selections.values() if factor is not None]}
-        for event_id, selections in rows.items()
-    ], count, incomplete
+            if type(odds) not in (float, int) or not 1 < odds <= float_info.max:
+                rows.invalid += 1
+                unavailable.add(key)
+                continue
+            variants = selections.setdefault(key, {})
+            previous = next(iter(variants.values()), None)
+            if previous is not None and previous["v"] != odds:
+                rows.price_conflicts.add(key)
+            # Calibrated mappings may require an exact threshold spelling.
+            variants.setdefault(str(factor.get("pt")), factor)
+
+    by_event = defaultdict(list)
+    for key, variants in selections.items():
+        if key not in unavailable:
+            by_event[key[0]].extend(variants.values())
+    rows.price_conflicts.difference_update(unavailable)
+    rows.blocks = [{"e": event_id, "factors": factors} for event_id, factors in by_event.items()]
+    return rows
 
 
 def _match_selections(
-    event_id: int, line_events: dict[int, dict[str, Any]], line_sports: list[Any],
+    event_id: int, line_events: dict[int, dict[str, Any]], line_sports: dict[int, dict[str, Any]],
     line_blocks: dict[int, set[int] | None], detail: dict[str, Any], window_end: float,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]], int, bool]:
-    if not isinstance(detail.get("events"), list) or not isinstance(detail.get("customFactors"), list):
-        raise ValueError("Missing Fonbet event or factor list")
-    if detail.get("fromVersion"):
-        raise ValueError("Expected a full Fonbet event snapshot")
-    if "sports" in detail and not isinstance(detail["sports"], list):
-        raise ValueError("Invalid Fonbet sports list")
-    detail_events = _by_id(detail)
+) -> tuple[dict[str, Any], list[dict[str, Any]], MarketRows] | None:
+    if not isinstance(detail.get("customFactors"), list) or detail.get("fromVersion", 0) != 0:
+        raise ValueError("Expected a full Fonbet event snapshot with factors")
+    detail_sports = _snapshot_index(detail, "sports") if "sports" in detail else {}
+    detail_events = _snapshot_index(detail, "events")
     if event_id not in detail_events:
         raise ValueError("Match missing from Fonbet details")
     events = {
@@ -171,7 +252,12 @@ def _match_selections(
     start = root.get("startTime")
     if (event_id in full_blocks or root.get("parentId") or not _prematch(root)
             or type(start) is not int or not datetime.now(timezone.utc).timestamp() < start <= window_end):
-        return None, [], 0, False
+        return None
+    if not all(root.get(team) for team in ("team1", "team2")):
+        raise ValueError("Missing team names in Fonbet details")
+    sports = {**line_sports, **detail_sports}
+    if _sport_name(sports, root.get("sportId"), prefer_root=True) != "Футбол":
+        return None
 
     linked = _match_tree(_children(events), event_id)
     eligible = {
@@ -180,12 +266,14 @@ def _match_selections(
         and not _unavailable(events[eid])
         and not _unavailable(events.get(events[eid].get("parentId"), {}))
     }
-    blocks, count, incomplete = _market_rows(detail, eligible, line_blocks, detail_blocks)
+    rows = _market_rows(detail, eligible, line_blocks, detail_blocks)
+    if rows.incomplete and not rows.processed:
+        raise ValueError("No usable factor rows in incomplete Fonbet details")
     # The line supplies hierarchy only. Every price comes from this detail snapshot.
-    metadata = {"events": [events[eid] for eid in sorted(linked)], "sports": line_sports}
-    data = {**detail, "events": [], "customFactors": blocks}
+    metadata = {"events": [events[eid] for eid in sorted(linked)], "sports": list(sports.values())}
+    data = {**detail, "events": [], "customFactors": rows.blocks}
     summary = summarize_match_line(event_id, data, metadata, include_zero_handicaps=True)
-    return root, _flatten(summary), count, incomplete
+    return root, _flatten(summary), rows
 
 
 def _flatten(summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -233,26 +321,31 @@ def _market_filter(item: dict[str, Any], requested: set[str]) -> bool:
 def _output_selections(
     items: list[dict[str, Any]], event: dict[str, Any], league: str | None,
     localized: dict[str, Any], received_at: datetime, requested: set[str],
-    min_odds: float, max_odds: float,
-) -> list[dict[str, Any]]:
+    min_odds: float, max_odds: float, price_conflicts: set[_FactorKey],
+) -> tuple[list[dict[str, Any]], int]:
     results = []
-    seen: set[tuple[str, str, str, str, Decimal | None, int | None]] = set()
+    groups: dict[_SelectionKey, dict[str, Any]] = {}
+    conflicting: set[_SelectionKey] = set()
     start = datetime.fromtimestamp(event["startTime"], tz=timezone.utc).isoformat()
     teams = {
         number: localized.get(f"team{number}") or event.get(f"team{number}")
         for number in (1, 2)
     }
     for item in sorted(items, key=lambda market: (market["event_id"], market["factor_id"])):
-        if not min_odds <= item["odds"] <= max_odds or not _market_filter(item, requested):
-            continue
         threshold = _number(item.get("threshold"))
         team_number = item.get("team_number")
         if item["category"] in {"handicaps", "outcomes"} and item["side"] in {"team1", "team2"}:
             team_number = int(item["side"][-1])
         key = (item["statistic"], item["period"], item["category"], item["side"], threshold, team_number)
-        if key in seen:
+        previous = groups.setdefault(key, item)
+        raw_key = (item["event_id"], item["factor_id"], threshold)
+        if previous["odds"] != item["odds"] or raw_key in price_conflicts:
+            conflicting.add(key)
+
+    for key, item in groups.items():
+        if key in conflicting or not min_odds <= item["odds"] <= max_odds or not _market_filter(item, requested):
             continue
-        seen.add(key)
+        threshold, team_number = key[-2:]
         results.append({
             "event_id": event["id"],
             "market_event_id": item["event_id"],
@@ -274,7 +367,11 @@ def _output_selections(
             "label": item["label"],
             "identification_basis": item["identification_basis"],
         })
-    return results
+    return results, len(conflicting)
+
+
+def _issue(stage: str, code: str, event_id: int | None = None) -> dict[str, Any]:
+    return {"stage": stage, "event_id": event_id, "code": code, "http_status": None}
 
 
 def _error(stage: str, exc: Exception, event_id: int | None = None) -> dict[str, Any]:
@@ -282,6 +379,8 @@ def _error(stage: str, exc: Exception, event_id: int | None = None) -> dict[str,
     code = {
         "HTTPStatusError": "http_error",
         "FonbetCooldownError": "retry_after_cooldown",
+        "FonbetRequestCapacityError": "request_capacity",
+        "FonbetSearchCapacityError": "search_capacity",
     }.get(type(exc).__name__, "invalid_response")
     if isinstance(exc, httpx.TimeoutException):
         code = "timeout"
@@ -290,19 +389,12 @@ def _error(stage: str, exc: Exception, event_id: int | None = None) -> dict[str,
     return {"stage": stage, "event_id": event_id, "code": code, "http_status": status}
 
 
-def _validate_line(payload: dict[str, Any]) -> None:
-    if payload.get("fromVersion") or not isinstance(payload.get("events"), list) or (
-        payload["events"] and not isinstance(payload.get("sports"), list)
-    ):
-        raise ValueError("Missing Fonbet line events or sports")
-
-
 async def search_candidates(
     client: FonbetClient, hours_ahead: float, min_odds: float, max_odds: float,
     markets: list[str] | None, limit: int, offset: int, lang: str,
 ) -> dict[str, Any]:
-    if not math.isfinite(hours_ahead) or hours_ahead <= 0:
-        raise ValueError("hours_ahead must be finite and positive")
+    if not 0 < hours_ahead <= MAX_HOURS_AHEAD:
+        raise ValueError(f"hours_ahead must be greater than 0 and at most {MAX_HOURS_AHEAD}")
     if not (1 < min_odds <= max_odds < float("inf")):
         raise ValueError("Expected 1 < min_odds <= max_odds with finite odds")
     if not 1 <= limit <= 500 or offset < 0:
@@ -314,37 +406,47 @@ async def search_candidates(
     if not lang:
         raise ValueError("lang must not be empty")
 
-    start = datetime.now(timezone.utc).timestamp()
-    end = start + hours_ahead * 3600
-    errors: list[dict[str, Any]] = []
-    selected: list[dict[str, Any]] = []
     result: dict[str, Any] = {
         "mode": "prematch", "limit": limit, "offset": offset, "next_offset": None,
         "line_received_at": None, "max_snapshot_age_seconds": client.policy.max_snapshot_age,
-        "matches_checked": 0, "markets_processed": 0, "skipped_events": 0,
-        "errors": errors, "error_count": 0, "partial": False, "status": "ok",
+        "root_events": 0, "eligible_matches": 0, "matches_checked": 0, "matches_completed": 0,
+        "markets_processed": 0, "invalid_market_rows": 0, "conflicting_markets": 0, "skipped_events": 0,
+        "errors": [], "error_count": 0, "partial": False, "status": "ok",
         "total_candidates": 0, "candidates": [],
     }
-    recoverable = (httpx.HTTPError, FonbetCooldownError, ValueError)
+    try:
+        with client.candidate_search_slot():
+            return await _scan(client, hours_ahead, min_odds, max_odds, requested, limit, offset, lang, result)
+    except FonbetSearchCapacityError as exc:
+        return {**result, "status": "error", "partial": True, "error_count": 1, "errors": [_error("scan", exc)]}
+
+
+async def _scan(
+    client: FonbetClient, hours_ahead: float, min_odds: float, max_odds: float,
+    requested: set[str], limit: int, offset: int, lang: str, result: dict[str, Any],
+) -> dict[str, Any]:
+    start = datetime.now(timezone.utc).timestamp()
+    end = start + hours_ahead * 3600
+    errors = result["errors"]
+    selected: list[dict[str, Any]] = []
     try:
         line = await client.current_line_snapshot("ru")
-        _validate_line(line.payload)
+        events, sports = _line_indexes(line.payload)
         line_blocks = _feed_blocks(line.payload)
-    except recoverable as exc:
+    except _RECOVERABLE as exc:
         errors.append(_error("line", exc))
         return {**result, "status": "error", "partial": True, "error_count": 1}
 
     result["line_received_at"] = line.received_at.isoformat()
     if line.age() >= client.policy.max_snapshot_age:
-        errors.append({"stage": "line", "event_id": None, "code": "stale_snapshot", "http_status": None})
+        errors.append(_issue("line", "stale_snapshot"))
         return {**result, "status": "error", "partial": True, "error_count": 1}
-    events = _by_id(line.payload)
-    sports = _sports_by_id(line.payload)
     children = _children(events)
     matches = []
     for event_id, event in events.items():
         if event.get("parentId"):
             continue
+        result["root_events"] += 1
         starts_at = event.get("startTime")
         if (
             type(starts_at) is int and start < starts_at <= end and _prematch(event)
@@ -353,12 +455,11 @@ async def search_candidates(
             and all(isinstance(event.get(team), str) and event[team].strip() for team in ("team1", "team2"))
         ):
             matches.append(event_id)
-        else:
-            result["skipped_events"] += 1
 
+    result["eligible_matches"] = len(matches)
     matches.sort(key=lambda event_id: (events[event_id]["startTime"], event_id))
     queued = iter(matches)
-    completed: dict[int, tuple[Snapshot, dict[str, Any], list[dict[str, Any]]]] = {}
+    completed: dict[int, tuple[Snapshot, dict[str, Any], list[dict[str, Any]], set[_FactorKey]]] = {}
     checked: set[int] = set()
     local_events: dict[int, dict[str, Any]] = {}
     local_sports = {}
@@ -370,28 +471,30 @@ async def search_candidates(
             try:
                 detail = await client.event_view_snapshot(event_id, "ru")
                 narrowed = {eid: events[eid] for eid in _match_tree(children, event_id)}
-                event, selections, count, incomplete = _match_selections(
-                    event_id, narrowed, line.payload.get("sports", []), line_blocks, detail.payload, end,
-                )
-                result["markets_processed"] += count
-                if incomplete:
-                    errors.append({
-                        "stage": "event", "event_id": event_id,
-                        "code": "incomplete_detail", "http_status": None,
-                    })
-                if event is not None:
-                    completed[event_id] = (detail, event, selections)
-            except recoverable as exc:
+                scanned = _match_selections(event_id, narrowed, sports, line_blocks, detail.payload, end)
+                if scanned is None:
+                    continue
+                event, selections, rows = scanned
+                result["markets_processed"] += rows.processed
+                result["invalid_market_rows"] += rows.invalid
+                if rows.incomplete:
+                    errors.append(_issue("event", "incomplete_detail", event_id))
+                if rows.invalid:
+                    errors.append(_issue("event", "invalid_market_rows", event_id))
+                completed[event_id] = (detail, event, selections, rows.price_conflicts)
+            except FonbetRequestCapacityError as exc:
+                checked.discard(event_id)
+                errors.append(_error("event", exc, event_id))
+                return
+            except _RECOVERABLE as exc:
                 errors.append(_error("event", exc, event_id))
 
     async def localize() -> None:
         nonlocal local_events, local_sports, local_line
         try:
             local_line = await client.current_line_snapshot(lang)
-            _validate_line(local_line.payload)
-            local_events = _by_id(local_line.payload)
-            local_sports = _sports_by_id(local_line.payload)
-        except recoverable as exc:
+            local_events, local_sports = _line_indexes(local_line.payload)
+        except _RECOVERABLE as exc:
             errors.append(_error("localization", exc))
 
     remaining = max(0, client.policy.max_snapshot_age - line.age())
@@ -402,26 +505,30 @@ async def search_candidates(
                 workers.append(localize())
             await asyncio.gather(*workers)
     except TimeoutError:
-        errors.append({"stage": "scan", "event_id": None, "code": "scan_deadline", "http_status": None})
+        errors.append(_issue("scan", "scan_deadline"))
 
     result["matches_checked"] = len(checked)
-    result["skipped_events"] += len(matches) - len(completed)
     if local_line is not None and local_line.age() >= client.policy.max_snapshot_age:
         local_events, local_sports = {}, {}
-        errors.append({"stage": "localization", "event_id": None, "code": "stale_snapshot", "http_status": None})
-    for event_id, (detail, event, selections) in completed.items():
+        errors.append(_issue("localization", "stale_snapshot"))
+    for event_id, (detail, event, selections, price_conflicts) in completed.items():
         if detail.age() >= client.policy.max_snapshot_age:
-            errors.append({"stage": "event", "event_id": event_id, "code": "stale_snapshot", "http_status": None})
+            errors.append(_issue("event", "stale_snapshot", event_id))
         elif event["startTime"] > datetime.now(timezone.utc).timestamp():
             localized = local_events.get(event_id, {})
             league = _sport_name(local_sports, localized.get("sportId"), prefer_root=False)
             league = league or _sport_name(sports, event.get("sportId"), prefer_root=False)
-            selected.extend(_output_selections(
+            matched, conflicts = _output_selections(
                 selections, event, league, localized, detail.received_at, requested, min_odds, max_odds,
-            ))
-            continue
-        result["skipped_events"] += 1
+                price_conflicts,
+            )
+            result["matches_completed"] += 1
+            result["conflicting_markets"] += conflicts
+            if conflicts:
+                errors.append(_issue("event", "conflicting_quotes", event_id))
+            selected.extend(matched)
 
+    result["skipped_events"] = result["root_events"] - result["matches_completed"]
     selected.sort(key=lambda item: (
         item["start_time"], item["event_id"], item["market_event_id"], item["factor_id"],
         item["threshold"] or "",
