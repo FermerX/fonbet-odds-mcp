@@ -94,7 +94,7 @@ not a Fonbet event/team ID. This phase intentionally does not guess mappings
 between the services; cross-provider matching requires an independently
 validated team-identity layer. For historical research, use an explicit
 timezone-aware `as_of_utc` value, e.g. `2026-11-01T18:00:00+00:00`,
-which strictly excludes games played after that instant.
+which excludes games beginning after that instant and applies a four-hour embargo\nafter kickoff to guard against look-ahead leakage from historical final scores.
 
 The response contains the latest available completed match sample and overall,
 home and away summaries: W/D/L, reported full-time goals for/against, rates for
