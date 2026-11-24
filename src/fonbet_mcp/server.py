@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 
+from fonbet_mcp.candidates import search_candidates
 from fonbet_mcp.summary import find_match_candidates, summarize_match_line
 from fonbet_mcp.security import build_auth_kwargs
 
@@ -29,13 +31,24 @@ client = FonbetClient(
     timeout=settings.timeout,
     current_line_path=settings.current_line_path,
     event_view_path=settings.event_view_path,
+    policy=settings.request_policy,
 )
 allowed_hosts = [item.strip() for item in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if item.strip()]
 dns_rebinding_protection = os.getenv("MCP_DNS_REBINDING_PROTECTION", "false").lower() == "true"
 server_port = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
 
+
+@asynccontextmanager
+async def server_lifespan(_: FastMCP):
+    try:
+        yield {}
+    finally:
+        await client.aclose()
+
+
 mcp = FastMCP(
     "fonbet",
+    lifespan=server_lifespan,
     instructions=(
         "Read Fonbet sports events and decimal odds. Use paginated market tools when a match "
         "has many markets. Treat value checks only as analytical signals, not betting guarantees."
@@ -200,6 +213,28 @@ async def get_cross_match_specials(
 async def fonbet_value_check(decimal_odds: float, estimated_probability: float) -> dict[str, Any]:
     """Check whether decimal odds have positive expected value for your estimated probability."""
     return value_check(decimal_odds=decimal_odds, estimated_probability=estimated_probability)
+
+
+
+@mcp.tool()
+async def fonbet_find_candidates(
+    hours_ahead: float = 4,
+    min_odds: float = 1.40,
+    max_odds: float = 1.60,
+    markets: list[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    lang: str = "ru",
+) -> dict[str, Any]:
+    """Find identified prematch football selections within an odds range and start-time window.
+
+    Market filters (OR): goals, corners, yellow_cards, totals, individual_totals,
+    outcomes, handicaps, double_chance, both_teams_score, halves, statistics,
+    fouls, shots_on_target, offsides, throw_ins, goal_kicks, shots, woodwork.
+    Use next_offset to page. Check partial and errors for coverage and received_at
+    for quote freshness. This screens prices without estimating win probability.
+    """
+    return await search_candidates(client, hours_ahead, min_odds, max_odds, markets, limit, offset, lang)
 
 
 def main() -> None:

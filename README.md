@@ -64,10 +64,86 @@ If you create a Web Service manually instead of Blueprint:
 - `fonbet_search_events` - search events by team, league, or sport.
 - `fonbet_event_odds` - compatibility tool: first large page of event odds by `event_id`.
 - `get_event_odds` - paginated full event markets; use `offset`, `limit`, `query`, and `next_offset`.
+- `get_match_markets` - paginated match and linked sub-event markets, including unlabeled factors.
+- `get_match_line` - compact, identified football markets for a match.
+- `get_unlabeled_pairs` - inspect unlabeled factor pairs for manual verification.
+- `fonbet_find_candidates` - find identified prematch football selections by start time, odds, and market category.
 - `get_special_bets` - search current line for special/player/stat-style markets.
 - `get_same_game_parlay` - inspect one event for same-game parlay ideas.
 - `get_cross_match_specials` - inspect special-style markets across multiple events.
 - `fonbet_value_check` - simple value-bet check from your estimated probability.
+
+## Find prematch football candidates
+
+Call `fonbet_find_candidates` with these MCP tool arguments:
+
+```json
+{
+  "hours_ahead": 4,
+  "min_odds": 1.40,
+  "max_odds": 1.60,
+  "markets": ["goals", "individual_totals", "double_chance"],
+  "limit": 20,
+  "offset": 0,
+  "lang": "ru"
+}
+```
+
+An empty argument object uses a four-hour window, the inclusive odds range 1.40–1.60,
+all identified categories, a page of 50, and Russian. The window starts at the
+time of the call. `limit` accepts 1–500 and `offset` starts at zero.
+The tool sorts by kickoff, event ID, market event ID, factor ID and threshold.
+Pass `next_offset` to fetch the next page with the same filters. Each page
+checks the current line, so market changes or kickoffs can move entries between
+calls.
+
+Market filters match any listed value. Use `totals`, `individual_totals`,
+`outcomes`, `handicaps`, `double_chance`, or `both_teams_score` for market
+types. Use `goals`, `corners`, `yellow_cards`, `fouls`, `shots_on_target`,
+`offsides`, `throw_ins`, `goal_kicks`, `shots`, or `woodwork` for the
+underlying statistic. `halves` includes identified first- and second-half
+markets. `statistics` includes the additional statistics from fouls through
+woodwork. Each candidate has a `category`, `statistic`, `period`, `side`,
+and match, market event and factor IDs. Russian metadata drives recognition.
+For other languages the tool requests localized team and league names and uses
+the Russian names where the feed has no translation. Market labels remain Russian.
+
+Quote `received_at` and `line_received_at` are UTC receipt timestamps from
+this server. Cached snapshots keep their original timestamps. The freshness
+limit includes the HTTP `Age` header when the upstream sends it. Odds come from
+the event detail response. A timeout or upstream error can leave a partial
+page, with `partial: true` and structured `errors`. A failed line request
+returns `status: "error"`. An empty valid line returns `status: "ok"`.
+`matches_checked` counts started detail checks, `markets_processed` counts
+factor rows examined before odds and category filters, and `skipped_events`
+counts root events excluded from the scan or omitted after a failed or incomplete
+check. `total_candidates` counts selections before pagination.
+
+`threshold_is_integer` distinguishes whole from fractional parameters.
+Settlement details such as refunds, quarter-line splits, and extra time require
+confirmation in the Fonbet betslip. This tool screens prices and makes no
+probability or return forecast.
+
+### HTTP client settings
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `FONBET_LINE_TTL` | 10 | Cache TTL for the general line, in seconds |
+| `FONBET_EVENT_TTL` | 15 | Cache TTL for event details, in seconds |
+| `FONBET_LINE_CACHE_SIZE` | 8 | Maximum cached line responses |
+| `FONBET_EVENT_CACHE_SIZE` | 256 | Maximum cached event responses |
+| `FONBET_REQUESTS_PER_SECOND` | 5 | Maximum outbound request start rate per server process |
+| `FONBET_MAX_CONCURRENCY` | 4 | Maximum concurrent upstream requests per server process |
+| `FONBET_RETRIES` | 2 | Additional attempts on network errors, timeouts, HTTP 429, and HTTP 500/502/503/504 |
+| `FONBET_MAX_RETRY_DELAY` | 5 | Maximum retry wait, in seconds |
+| `FONBET_MAX_SNAPSHOT_AGE` | 60 | Maximum snapshot age and scan deadline, measured from receipt of the line |
+
+Set either TTL or cache size to zero to disable reuse for that cache. Concurrent
+identical requests share one upstream operation. A longer upstream
+`Retry-After` pauses new upstream requests and returns a visible error to the
+caller. Expired cache entries are never used as a fallback.
+
+Run the full suite with `python -m unittest discover -s tests -v`.
 
 ## Extended football line (opt-in branch)
 

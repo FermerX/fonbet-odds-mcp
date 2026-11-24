@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from fonbet_mcp.client import RequestPolicy
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -13,6 +15,7 @@ class Settings:
     event_view_path: str
     scope_market: str
     timeout: float
+    request_policy: RequestPolicy = RequestPolicy()
 
 
 def load_settings() -> Settings:
@@ -23,4 +26,15 @@ def load_settings() -> Settings:
         event_view_path=os.getenv("FONBET_EVENT_VIEW_PATH", "/events/event"),
         scope_market=os.getenv("FONBET_SCOPE_MARKET", "1600"),
         timeout=float(os.getenv("FONBET_TIMEOUT", "20")),
+        request_policy=RequestPolicy(
+            line_ttl=float(os.getenv("FONBET_LINE_TTL", "10")),
+            event_ttl=float(os.getenv("FONBET_EVENT_TTL", "15")),
+            line_cache_size=int(os.getenv("FONBET_LINE_CACHE_SIZE", "8")),
+            event_cache_size=int(os.getenv("FONBET_EVENT_CACHE_SIZE", "256")),
+            requests_per_second=float(os.getenv("FONBET_REQUESTS_PER_SECOND", "5")),
+            max_concurrency=int(os.getenv("FONBET_MAX_CONCURRENCY", "4")),
+            retries=int(os.getenv("FONBET_RETRIES", "2")),
+            max_retry_delay=float(os.getenv("FONBET_MAX_RETRY_DELAY", "5")),
+            max_snapshot_age=float(os.getenv("FONBET_MAX_SNAPSHOT_AGE", "60")),
+        ),
     )

@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
+from fonbet_mcp.client import FonbetClient as FonbetClient
 
 
 @dataclass(frozen=True)
@@ -15,44 +15,6 @@ class EventSummary:
     league: str | None
     start_time: int | None
     status: str | None
-
-
-class FonbetClient:
-    def __init__(
-        self,
-        base_url: str,
-        scope_market: str = "1600",
-        timeout: float = 20,
-        current_line_path: str = "/events/listBase",
-        event_view_path: str = "/events/event",
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.scope_market = scope_market
-        self.timeout = timeout
-        self.current_line_path = current_line_path
-        self.event_view_path = event_view_path
-
-    async def current_line(self, lang: str = "ru") -> dict[str, Any]:
-        return await self._get(
-            self.current_line_path.format(lang=lang),
-            params={"scopeMarket": self.scope_market, "lang": lang},
-        )
-
-    async def event_view(self, event_id: int, lang: str = "ru") -> dict[str, Any]:
-        return await self._get(
-            self.event_view_path,
-            params={"eventId": event_id, "lang": lang, "scopeMarket": self.scope_market},
-        )
-
-    async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        headers = {"user-agent": "Mozilla/5.0", "referer": "https://fon.bet/"}
-        async with httpx.AsyncClient(timeout=self.timeout, headers=headers) as client:
-            response = await client.get(f"{self.base_url}{path}", params=params)
-            response.raise_for_status()
-            payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Fonbet returned a non-object JSON payload")
-        return payload
 
 
 def search_events(payload: dict[str, Any], query: str, limit: int = 20) -> list[EventSummary]:
