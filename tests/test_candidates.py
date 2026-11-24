@@ -12,6 +12,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from fonbet_mcp import server
 from fonbet_mcp.candidates import _page, search_candidates
 from fonbet_mcp.client import FonbetClient, RequestPolicy, Snapshot
+from fonbet_mcp.football_stats import FootballDataClient
 from fonbet_mcp.search_state import Quote
 
 
@@ -692,9 +693,12 @@ class CandidateTests(unittest.IsolatedAsyncioTestCase):
             "get_cross_match_specials": ({}, "specials"),
             "fonbet_value_check": ({"decimal_odds": 1.5, "estimated_probability": 0.7}, "is_value"),
             "fonbet_find_candidates": ({"markets": ["goals"]}, "candidates"),
+            "football_team_form": ({"team_id": 65}, "status"),
         }
         client = self.client()
-        with patch.object(server, "client", client):
+        statistics = FootballDataClient(None)
+        self.addAsyncCleanup(statistics.aclose)
+        with patch.object(server, "client", client), patch.object(server, "stats_client", statistics):
             async with create_connected_server_and_client_session(server.mcp) as session:
                 listing = await session.list_tools()
                 self.assertEqual({tool.name for tool in listing.tools}, calls.keys())
@@ -706,3 +710,5 @@ class CandidateTests(unittest.IsolatedAsyncioTestCase):
                             self.assertIn(field, result.structuredContent)
                         if name == "fonbet_find_candidates":
                             self.assertEqual(result.structuredContent["total_candidates"], 1)
+                        if name == "football_team_form":
+                            self.assertEqual(result.structuredContent["status"], "not_configured")

@@ -11,6 +11,7 @@ from pydantic import Field
 from starlette.applications import Starlette
 
 from fonbet_mcp.candidates import MAX_HOURS_AHEAD, search_candidates
+from fonbet_mcp.football_stats import FootballDataClient
 from fonbet_mcp.summary import find_match_candidates, summarize_match_line
 from fonbet_mcp.security import build_auth_kwargs
 
@@ -28,6 +29,7 @@ from fonbet_mcp.fonbet import (
 
 settings = load_settings()
 client: FonbetClient | None = None
+stats_client: FootballDataClient | None = None
 allowed_hosts = [item.strip() for item in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if item.strip()]
 dns_rebinding_protection = os.getenv("MCP_DNS_REBINDING_PROTECTION", "false").lower() == "true"
 server_port = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
@@ -50,19 +52,30 @@ def get_client() -> FonbetClient:
     return client
 
 
+def get_stats_client() -> FootballDataClient:
+    if stats_client is None:
+        raise RuntimeError("The football statistics client is not running")
+    return stats_client
+
+
 @asynccontextmanager
 async def application_client():
-    global client
-    if client is not None:
+    global client, stats_client
+    if client is not None or stats_client is not None:
         raise RuntimeError("The Fonbet application is already running")
     active_client = client = create_client()
+    active_stats = stats_client = FootballDataClient(token=os.getenv("FOOTBALL_DATA_API_TOKEN"))
     try:
         yield
     finally:
         try:
-            await active_client.aclose()
+            await active_stats.aclose()
         finally:
-            client = None
+            try:
+                await active_client.aclose()
+            finally:
+                client = None
+                stats_client = None
 
 
 def _wrap_http_lifespan(app: Starlette) -> Starlette:
@@ -289,6 +302,22 @@ async def fonbet_find_candidates(
         get_client(), hours_ahead, min_odds, max_odds, markets, limit, offset, lang,
         search_id, cursor, resume, refresh,
     )
+
+
+@mcp.tool()
+async def football_team_form(
+    team_id: int,
+    last_n: int = 10,
+    as_of_utc: str | None = None,
+) -> dict[str, Any]:
+    """Independent completed-match form from football-data.org (optional API token).
+
+    team_id is a football-data.org ID, not a Fonbet ID. Never silently
+    match teams across providers. Uses only provider-reported full-time scores
+    strictly before as_of_utc. Returns samples and home/away splits, not xG,
+    injury data, estimated probabilities, value claims, or bet instructions.
+    """
+    return await get_stats_client().team_form(team_id, last_n, as_of_utc)
 
 
 def main() -> None:
