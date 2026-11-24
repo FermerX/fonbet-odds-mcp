@@ -64,10 +64,152 @@ If you create a Web Service manually instead of Blueprint:
 - `fonbet_search_events` - search events by team, league, or sport.
 - `fonbet_event_odds` - compatibility tool: first large page of event odds by `event_id`.
 - `get_event_odds` - paginated full event markets; use `offset`, `limit`, `query`, and `next_offset`.
+- `get_match_markets` - paginated match and linked sub-event markets, including unlabeled factors.
+- `get_match_line` - compact, identified football markets for a match.
+- `get_unlabeled_pairs` - inspect unlabeled factor pairs for manual verification.
+- `fonbet_find_candidates` - find identified prematch football selections by start time, odds, and market category.
 - `get_special_bets` - search current line for special/player/stat-style markets.
 - `get_same_game_parlay` - inspect one event for same-game parlay ideas.
 - `get_cross_match_specials` - inspect special-style markets across multiple events.
 - `fonbet_value_check` - simple value-bet check from your estimated probability.
+
+## Find prematch football candidates
+
+Call `fonbet_find_candidates` with these MCP tool arguments:
+
+```json
+{
+  "hours_ahead": 4,
+  "min_odds": 1.40,
+  "max_odds": 1.60,
+  "markets": ["goals", "individual_totals", "double_chance"],
+  "limit": 20,
+  "offset": 0,
+  "lang": "ru"
+}
+```
+
+An empty argument object uses a four-hour window, the inclusive odds range 1.40–1.60,
+all identified categories, a page of 50, and Russian. The window starts at the
+time of the call. `hours_ahead` accepts values greater than zero and up to 12 hours.
+`limit` accepts 1–500 and `offset` starts at zero.
+The tool sorts by kickoff, event ID, market event ID, factor ID and threshold.
+Each search returns an opaque `search_id`, its absolute `window_start` and
+`window_end`, frozen `filters`, the coverage counters, and a `revision`.
+Follow `next_cursor` to read the same revision without a new scan:
+
+```json
+{"cursor": "<next_cursor>", "limit": 20}
+```
+
+Legacy `offset` and `next_offset` are still accepted. With `search_id`,
+an offset addresses the latest revision. Without an ID, an offset applies
+to the currently resolved search for those filters. Use the cursor to pin a
+revision across calls. Search filters and the absolute time window come from
+the stored search when an ID or cursor is supplied. Pagination parameters do
+not affect coalescing of identical searches.
+
+When the scan reaches its deadline, `search_status` is `paused` and
+`remaining_matches` counts fixtures still awaiting a terminal check. Resume the
+same window with:
+
+```json
+{"search_id": "<search_id>", "resume": true, "limit": 20}
+```
+
+Continuation publishes a new sorted revision and checks only pending matches.
+Existing cursors keep their earlier order and coverage counters. The server
+rechecks pending fixtures against a current line and reports fixtures that have
+left the window or become unavailable in `matches_no_longer_eligible`.
+The initial line's identified price hints determine scan priority; matches
+without hints remain in the queue. Terminal upstream errors are reported with
+the original coverage. Start a new search to retry those fixtures.
+
+Market filters match any listed value. Use `totals`, `individual_totals`,
+`outcomes`, `handicaps`, `double_chance`, or `both_teams_score` for market
+types. Use `goals`, `corners`, `yellow_cards`, `fouls`, `shots_on_target`,
+`offsides`, `throw_ins`, `goal_kicks`, `shots`, or `woodwork` for the
+underlying statistic. `halves` includes identified first- and second-half
+markets. `statistics` includes the additional statistics from fouls through
+woodwork. Each candidate has a `category`, `statistic`, `period`, `side`,
+and match, market event and factor IDs. Russian metadata drives recognition.
+For other languages the tool requests localized team and league names and uses
+the Russian names where the feed has no translation. Market labels remain Russian.
+
+Quote `received_at` and `line_received_at` are UTC receipt timestamps from
+this server. Odds come from the event detail response. The effective age
+includes the upstream HTTP `Age` header when present. Page reads preserve
+`received_at`. A quote marked `snapshot` is eligible for display under the
+current freshness limits. During replay, both source cache TTLs must still be
+valid. Stale or superseded quotes and quotes past their recorded kickoff retain
+their position and have `odds: null`.
+
+To verify only the current page, pass `refresh: true` with a cursor or
+`search_id`. An unchanged and available quote gets `quote_status: "verified"`
+and a separate `verified_at`. A changed, blocked, missing or unverifiable
+quote keeps its position, gets an explicit status, and has `odds: null`.
+A timeout or upstream error can leave a partial page, with `partial: true`
+and structured `errors`. A failed line request returns `status: "error"`.
+An empty valid line returns `status: "ok"`. `search_status` reports scan
+coverage separately from the current page's quote availability.
+`root_events` counts distinct root events in the line. `eligible_matches` counts
+prematch football fixtures in the requested window. `matches_checked` counts
+admitted detail checks, including checks that fail or run out of time.
+`matches_completed` counts fixtures with fresh, processed details, including
+usable parts of incomplete responses. `skipped_events` is the difference
+between `root_events` and `matches_completed`. `markets_processed` counts all
+factor rows examined in eligible detail blocks, including invalid rows
+(`invalid_market_rows`) and duplicates. `total_candidates` counts selections
+before pagination. Identified aliases at equal prices count once. Conflicting
+prices for the same selection suppress that selection before applying the odds
+filter and increment `conflicting_markets`.
+
+At capacity, the tool reports `search_capacity` for a refused scan,
+`request_capacity` when a detail check cannot be queued, and explicit
+`match_capacity` or `result_capacity` when a search exceeds its storage limits.
+The application keeps up to four revisions per search. Expired or evicted
+searches and revisions return `search_expired` or `revision_expired`.
+
+`diagnostics` reports lookup hits and misses, coalesced detail and search
+requests, actual HTTP attempts and retries, queue wait, network and processing
+seconds, and quote age. The queue and network durations sum time across
+workers. An HTTP attempt shared by multiple calls is attributed to its
+originating operation. `scan_diagnostics` preserves the counters at the point
+a revision was published. Results are in memory and expire on process restart.
+
+`threshold_is_integer` distinguishes whole from fractional parameters.
+Settlement details such as refunds, quarter-line splits, and extra time require
+confirmation in the Fonbet betslip. This tool screens prices and makes no
+probability or return forecast.
+
+### HTTP client settings
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `FONBET_LINE_TTL` | 10 | Cache TTL for the general line, in seconds |
+| `FONBET_EVENT_TTL` | 15 | Cache TTL for event details, in seconds |
+| `FONBET_LINE_CACHE_SIZE` | 8 | Maximum cached line responses |
+| `FONBET_EVENT_CACHE_SIZE` | 256 | Maximum cached event responses |
+| `FONBET_REQUESTS_PER_SECOND` | 5 | Maximum outbound request start rate per server process |
+| `FONBET_MAX_CONCURRENCY` | 4 | Maximum concurrent upstream requests per server process |
+| `FONBET_MAX_INFLIGHT_REQUESTS` | 32 | Maximum distinct upstream requests active, queued, or waiting to retry per server process |
+| `FONBET_MAX_CONCURRENT_SEARCHES` | 2 | Maximum simultaneous candidate scans or page verifications per server process |
+| `FONBET_SEARCH_CACHE_SIZE` | 8 | Maximum retained searches per server process |
+| `FONBET_SEARCH_STATE_TTL` | 180 | Absolute retention of search metadata and cursors, in seconds |
+| `FONBET_SEARCH_MAX_CANDIDATES` | 10000 | Maximum stored selections per search |
+| `FONBET_SEARCH_MAX_MATCHES` | 3000 | Maximum frozen fixtures per search |
+| `FONBET_RETRIES` | 2 | Additional attempts on network errors, timeouts, HTTP 429, and HTTP 500/502/503/504 |
+| `FONBET_MAX_RETRY_DELAY` | 5 | Maximum retry wait, in seconds |
+| `FONBET_MAX_SNAPSHOT_AGE` | 60 | Maximum snapshot age and scan deadline, measured from receipt of the line |
+
+Set the line or event TTL or cache size to zero to disable reuse for that source.
+Search metadata retention is independent of quote freshness. Concurrent
+identical requests share one upstream operation. All MCP sessions served by the
+same process share the client, caches and rate limits. A longer upstream
+`Retry-After` pauses new upstream requests and returns a visible error to the
+caller. Expired cache entries are never used as a fallback.
+
+Run the full suite with `python -m unittest discover -s tests -v`.
 
 ## Extended football line (opt-in branch)
 

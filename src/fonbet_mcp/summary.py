@@ -173,6 +173,7 @@ _EXTRA_SECTION_NAMES: dict[str, str] = {
 _PERIOD_NAMES: dict[str, str] = {"1-й тайм": "first_half", "2-й тайм": "second_half"}
 _OUTCOME_IDS = frozenset((921, 922, 923, 924, 925, 1571))
 _HANDICAP_IDS = frozenset((927, 928))
+_ZERO_HANDICAP_TEAMS = {2820: 1, 2821: 2}
 _BOTH_SCORE_IDS = frozenset((709, 710))
 
 
@@ -211,6 +212,8 @@ def _expanded_identified_sections(
     markets: list[dict[str, Any]],
     events: dict[int, dict[str, Any]],
     root_id: int,
+    *,
+    include_zero_handicaps: bool = False,
 ) -> tuple[dict[str, dict[str, dict[str, list[dict[str, Any]]]]], int]:
     """Append safe, context-aware markets without re-labelling unknown factor IDs.
 
@@ -244,9 +247,9 @@ def _expanded_identified_sections(
             if period == "full_time" and category in _SECTIONS:
                 continue
             kind = "total"
-        elif factor_id in _HANDICAP_IDS:
+        elif factor_id in _HANDICAP_IDS or (include_zero_handicaps and factor_id in _ZERO_HANDICAP_TEAMS):
             kind = "handicap"
-            team_num = 1 if factor_id == 927 else 2
+            team_num = _ZERO_HANDICAP_TEAMS.get(factor_id, 1 if factor_id == 927 else 2)
             possible_team = root.get(f"team{team_num}")
             team = possible_team if isinstance(possible_team, str) and possible_team.strip() else None
         elif factor_id in _OUTCOME_IDS:
@@ -256,7 +259,11 @@ def _expanded_identified_sections(
         else:
             continue
 
-        if kind in ("total", "handicap"):
+        if factor_id in _ZERO_HANDICAP_TEAMS:
+            if market.get("name") != known_name or market.get("param_text") not in (None, "", "0", 0):
+                continue
+            threshold = "0"
+        elif kind in ("total", "handicap"):
             raw_threshold = market.get("param_text")
             if raw_threshold in (None, ""):
                 continue
@@ -283,7 +290,7 @@ def _expanded_identified_sections(
             "category": category,
             "period": period,
             "kind": kind,
-            "label": known_name if threshold is None else f"{known_name} ({threshold})",
+            "label": market["name"],
             "odds": odds,
             "break_even_percent": round(100 / odds, 2),
             "identification_basis": "known_factor_id_and_explicit_event_path",
@@ -309,6 +316,8 @@ def summarize_match_line(
     event_id: int,
     event_view_payload: dict[str, Any],
     line_payload: dict[str, Any],
+    *,
+    include_zero_handicaps: bool = False,
 ) -> dict[str, Any]:
     """Return compact verified totals, without false probabilities or predictions."""
     all_markets: list[dict[str, Any]] = []
@@ -360,7 +369,9 @@ def summarize_match_line(
                 0 if x["direction"] == "over" else 1,
                 x["factor_id"],
             ))
-    expanded, expanded_count = _expanded_identified_sections(all_markets, events, event_id)
+    expanded, expanded_count = _expanded_identified_sections(
+        all_markets, events, event_id, include_zero_handicaps=include_zero_handicaps,
+    )
     return {
         "status": "ok",
         "event": {
