@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections import defaultdict
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from sys import float_info
@@ -17,15 +17,19 @@ from fonbet_mcp.client import (
     FonbetCooldownError,
     FonbetRequestCapacityError,
     FonbetSearchCapacityError,
+    RequestMetrics,
     Snapshot,
+    request_metrics,
 )
 from fonbet_mcp.fonbet import (
     _KNOWN_FACTOR_NAMES,
     _VERIFIED_TEAM_CORNER_FACTOR_IDS,
     _VERIFIED_TEAM_GOAL_FACTOR_IDS,
     _VERIFIED_TEAM_YELLOW_CARD_FACTOR_IDS,
+    _factor_blocks_by_event,
     _sport_name,
 )
+from fonbet_mcp.search_state import Quote, SearchKey, SearchRevision, SearchState
 from fonbet_mcp.summary import _EXTRA_SECTION_NAMES, _ZERO_HANDICAP_TEAMS, summarize_match_line
 
 MAX_HOURS_AHEAD = 12
@@ -308,7 +312,7 @@ def _flatten(summary: dict[str, Any]) -> list[dict[str, Any]]:
     return results
 
 
-def _market_filter(item: dict[str, Any], requested: set[str]) -> bool:
+def _market_filter(item: dict[str, Any], requested: set[str] | frozenset[str]) -> bool:
     return (
         not requested
         or item["category"] in requested
@@ -320,7 +324,7 @@ def _market_filter(item: dict[str, Any], requested: set[str]) -> bool:
 
 def _output_selections(
     items: list[dict[str, Any]], event: dict[str, Any], league: str | None,
-    localized: dict[str, Any], received_at: datetime, requested: set[str],
+    localized: dict[str, Any], received_at: datetime, requested: set[str] | frozenset[str],
     min_odds: float, max_odds: float, price_conflicts: set[_FactorKey],
 ) -> tuple[list[dict[str, Any]], int]:
     results = []
@@ -389,154 +393,535 @@ def _error(stage: str, exc: Exception, event_id: int | None = None) -> dict[str,
     return {"stage": stage, "event_id": event_id, "code": code, "http_status": status}
 
 
-async def search_candidates(
-    client: FonbetClient, hours_ahead: float, min_odds: float, max_odds: float,
-    markets: list[str] | None, limit: int, offset: int, lang: str,
+def _timestamp(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+
+
+def _coverage(
+    state: SearchState, stage_errors: list[dict[str, Any]], *, initial_error: bool = False,
 ) -> dict[str, Any]:
+    errors = sorted([*state.errors, *stage_errors], key=lambda item: (item["stage"], item["event_id"] or 0))
+    partial = bool(errors or state.remaining)
+    return {
+        "line_received_at": state.line_received_at,
+        "latest_line_received_at": state.latest_line_received_at,
+        "root_events": state.root_events, "eligible_matches": state.eligible,
+        "matches_checked": len(state.checked), "matches_completed": state.completed,
+        "remaining_matches": state.remaining, "matches_no_longer_eligible": state.no_longer_eligible,
+        "markets_processed": state.processed,
+        "invalid_market_rows": state.invalid_rows, "conflicting_markets": state.conflicts,
+        "skipped_events": state.root_events - state.completed,
+        "errors": errors, "error_count": len(errors), "partial": partial,
+        "status": "error" if initial_error else "partial" if partial else "ok",
+        "search_status": "error" if initial_error else "paused" if state.remaining else "partial" if partial else "complete",
+    }
+
+
+def _expired(client: FonbetClient, search_id: str | None, code: str, limit: int, offset: int) -> dict[str, Any]:
+    return {
+        "search_id": search_id, "search_status": "expired" if code.endswith("expired") else "error",
+        "status": "error", "partial": True,
+        "errors": [_issue("search", code)], "error_count": 1, "mode": "prematch",
+        "max_snapshot_age_seconds": client.policy.max_snapshot_age, "line_received_at": None,
+        "root_events": 0, "eligible_matches": 0, "matches_checked": 0, "matches_completed": 0,
+        "remaining_matches": 0, "matches_no_longer_eligible": 0,
+        "markets_processed": 0, "invalid_market_rows": 0,
+        "conflicting_markets": 0, "skipped_events": 0,
+        "candidates": [], "total_candidates": 0, "limit": limit, "offset": offset,
+        "next_offset": None, "next_cursor": None, "diagnostics": asdict(RequestMetrics()),
+    }
+
+
+def _search_key(
+    hours_ahead: float, min_odds: float, max_odds: float, markets: list[str] | None, lang: str,
+) -> SearchKey:
     if not 0 < hours_ahead <= MAX_HOURS_AHEAD:
         raise ValueError(f"hours_ahead must be greater than 0 and at most {MAX_HOURS_AHEAD}")
-    if not (1 < min_odds <= max_odds < float("inf")):
+    if not 1 < min_odds <= max_odds < float("inf"):
         raise ValueError("Expected 1 < min_odds <= max_odds with finite odds")
-    if not 1 <= limit <= 500 or offset < 0:
-        raise ValueError("Expected 1 <= limit <= 500 and offset >= 0")
-    requested = {market.strip().lower() for market in markets or []}
+    requested = frozenset(market.strip().lower() for market in markets or [])
     if unknown := requested - _MARKETS:
         raise ValueError("Unsupported markets: " + ", ".join(sorted(unknown)))
     lang = lang.strip().lower()
     if not lang:
         raise ValueError("lang must not be empty")
+    return hours_ahead, min_odds, max_odds, requested, lang
 
-    result: dict[str, Any] = {
-        "mode": "prematch", "limit": limit, "offset": offset, "next_offset": None,
-        "line_received_at": None, "max_snapshot_age_seconds": client.policy.max_snapshot_age,
-        "root_events": 0, "eligible_matches": 0, "matches_checked": 0, "matches_completed": 0,
-        "markets_processed": 0, "invalid_market_rows": 0, "conflicting_markets": 0, "skipped_events": 0,
-        "errors": [], "error_count": 0, "partial": False, "status": "ok",
-        "total_candidates": 0, "candidates": [],
-    }
+
+def _parse_cursor(cursor: str) -> tuple[str, int, int]:
+    if len(cursor) > 80:
+        raise ValueError("Invalid cursor")
+    parts = cursor.split(".")
+    if len(parts) != 3 or len(parts[0]) != 32 or not all(part.isascii() and part.isdecimal() for part in parts[1:]):
+        raise ValueError("Invalid cursor")
+    return parts[0], int(parts[1]), int(parts[2])
+
+
+def _observe_scan(task: asyncio.Task[int]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def search_candidates(
+    client: FonbetClient, hours_ahead: float, min_odds: float, max_odds: float,
+    markets: list[str] | None, limit: int, offset: int, lang: str,
+    search_id: str | None = None, cursor: str | None = None, resume: bool = False, refresh: bool = False,
+) -> dict[str, Any]:
+    if not 1 <= limit <= 500 or offset < 0:
+        raise ValueError("Expected 1 <= limit <= 500 and offset >= 0")
+    revision = None
+    if cursor is not None:
+        cursor_id, revision, cursor_offset = _parse_cursor(cursor)
+        if resume or offset or (search_id is not None and search_id != cursor_id):
+            raise ValueError("Cursor cannot be combined with resume, an offset or a different search_id")
+        search_id, offset = cursor_id, cursor_offset
+    if search_id is None and (resume or refresh):
+        raise ValueError("Pass a search_id or cursor to continue or refresh a page")
+
+    store = client.searches
+    is_new = False
+    if search_id is not None:
+        state = store.get(search_id)
+        if state is None:
+            return _expired(client, search_id, "search_expired", limit, offset)
+    else:
+        key = _search_key(hours_ahead, min_odds, max_odds, markets, lang)
+        state = store.find(key)
+        if state is None:
+            if not client.search_capacity_available():
+                return _expired(client, None, "search_capacity", limit, offset)
+            state = store.create(key, datetime.now(timezone.utc).timestamp())
+            if state is None:
+                return _expired(client, None, "search_capacity", limit, offset)
+            is_new = True
+
+    own_scan = is_new or (resume and not state.running and (state.matches is None or state.remaining > 0))
+    joined = state.running and (resume or revision is None and (search_id is None or not state.revisions))
+    if own_scan:
+        if not client.search_capacity_available():
+            return _expired(client, state.id, "search_capacity", limit, offset)
+        state.task = asyncio.create_task(_run_scan(client, state))
+        state.task.add_done_callback(_observe_scan)
+    if (own_scan or joined) and state.task is not None:
+        revision = await asyncio.shield(state.task)
+    revision = state.revision if revision is None else revision
+    view = state.revisions.get(revision)
+    if view is None:
+        return _expired(client, state.id, "revision_expired", limit, offset)
+    return await _page(client, state, view, revision, limit, offset, own_scan, joined, refresh)
+
+
+@dataclass
+class LineContext:
+    snapshot: Snapshot
+    events: dict[int, dict[str, Any]]
+    sports: dict[int, dict[str, Any]]
+    blocks: dict[int, set[int] | None]
+    children: dict[int, list[int]]
+
+    def match_events(self, event_id: int) -> dict[int, dict[str, Any]]:
+        return {eid: self.events[eid] for eid in _match_tree(self.children, event_id)}
+
+
+async def _line_context(client: FonbetClient, metrics: RequestMetrics) -> LineContext:
+    line = await client.current_line_snapshot("ru")
+    tick = asyncio.get_running_loop().time()
+    try:
+        events, sports = _line_indexes(line.payload)
+        return LineContext(line, events, sports, _feed_blocks(line.payload), _children(events))
+    finally:
+        metrics.processing_seconds += asyncio.get_running_loop().time() - tick
+
+
+def _eligible(line: LineContext, event_id: int, state: SearchState) -> bool:
+    event = line.events.get(event_id)
+    if event is None or event.get("parentId") or (event_id in line.blocks and line.blocks[event_id] is None):
+        return False
+    starts_at = event.get("startTime")
+    return (
+        type(starts_at) is int
+        and max(state.start, datetime.now(timezone.utc).timestamp()) < starts_at <= state.end
+        and _prematch(event)
+        and _sport_name(line.sports, event.get("sportId"), prefer_root=True) == "Футбол"
+        and all(isinstance(event.get(team), str) and event[team].strip() for team in ("team1", "team2"))
+    )
+
+
+def _prioritize(line: LineContext, state: SearchState, matches: list[int]) -> tuple[int, ...]:
+    payload = line.snapshot.payload
+    factors = _factor_blocks_by_event(payload) if isinstance(payload.get("customFactors"), list) else {}
+    minimum, maximum = state.key[1:3]
+
+    def priority(event_id: int) -> tuple[bool, int, int]:
+        hint = any(
+            isinstance(factor, dict)
+            and type(factor.get("f")) is int and factor["f"] in _SUPPORTED_FACTORS
+            and type(factor.get("v")) in (float, int) and minimum <= factor["v"] <= maximum
+            and not _unavailable(factor)
+            for eid in _match_tree(line.children, event_id) for factor in factors.get(eid, ())
+        )
+        return not hint, line.events[event_id]["startTime"], event_id
+
+    return tuple(sorted(matches, key=priority))
+
+
+async def _run_scan(client: FonbetClient, state: SearchState) -> int:
+    metrics = RequestMetrics()
+    token = request_metrics.set(metrics)
+    state.reusable_until = 0
     try:
         with client.candidate_search_slot():
-            return await _scan(client, hours_ahead, min_odds, max_odds, requested, limit, offset, lang, result)
+            async with asyncio.timeout_at(state.expires_at):
+                stage_errors, reusable_until = await _scan(client, state, metrics)
+    except TimeoutError:
+        stage_errors, reusable_until = [_issue("scan", "scan_deadline")], 0
     except FonbetSearchCapacityError as exc:
-        return {**result, "status": "error", "partial": True, "error_count": 1, "errors": [_error("scan", exc)]}
+        stage_errors, reusable_until = [_error("scan", exc)], 0
+    finally:
+        request_metrics.reset(token)
+
+    loop = asyncio.get_running_loop()
+    processing = loop.time()
+    coverage = _coverage(state, stage_errors, initial_error=state.matches is None)
+    if not coverage["partial"]:
+        state.reusable_until = reusable_until
+    state.publish(coverage)
+    metrics.processing_seconds += loop.time() - processing
+    coverage["scan_diagnostics"] = asdict(metrics)
+    return state.revision
 
 
 async def _scan(
-    client: FonbetClient, hours_ahead: float, min_odds: float, max_odds: float,
-    requested: set[str], limit: int, offset: int, lang: str, result: dict[str, Any],
-) -> dict[str, Any]:
-    start = datetime.now(timezone.utc).timestamp()
-    end = start + hours_ahead * 3600
-    errors = result["errors"]
-    selected: list[dict[str, Any]] = []
+    client: FonbetClient, state: SearchState, metrics: RequestMetrics,
+) -> tuple[list[dict[str, Any]], float]:
+    loop = asyncio.get_running_loop()
     try:
-        line = await client.current_line_snapshot("ru")
-        events, sports = _line_indexes(line.payload)
-        line_blocks = _feed_blocks(line.payload)
+        line = await _line_context(client, metrics)
     except _RECOVERABLE as exc:
-        errors.append(_error("line", exc))
-        return {**result, "status": "error", "partial": True, "error_count": 1}
+        return [_error("line", exc)], 0
+    if line.snapshot.age() >= client.policy.max_snapshot_age:
+        return [_issue("line", "stale_snapshot")], 0
+    current_receipt = line.snapshot.received_at.isoformat()
+    state.latest_line_received_at = current_receipt
+    if state.matches is None:
+        processing = loop.time()
+        state.line_received_at = current_receipt
+        roots = [eid for eid, event in line.events.items() if not event.get("parentId")]
+        state.root_events = len(roots)
+        eligible = [eid for eid in roots if _eligible(line, eid, state)]
+        state.eligible = len(eligible)
+        if len(eligible) > client.policy.search_max_matches:
+            return [_issue("scan", "match_capacity")], 0
+        state.matches = _prioritize(line, state, eligible)
+        metrics.processing_seconds += loop.time() - processing
 
-    result["line_received_at"] = line.received_at.isoformat()
-    if line.age() >= client.policy.max_snapshot_age:
-        errors.append(_issue("line", "stale_snapshot"))
-        return {**result, "status": "error", "partial": True, "error_count": 1}
-    children = _children(events)
-    matches = []
-    for event_id, event in events.items():
-        if event.get("parentId"):
-            continue
-        result["root_events"] += 1
-        starts_at = event.get("startTime")
-        if (
-            type(starts_at) is int and start < starts_at <= end and _prematch(event)
-            and (event_id not in line_blocks or line_blocks[event_id] is not None)
-            and _sport_name(sports, event.get("sportId"), prefer_root=True) == "Футбол"
-            and all(isinstance(event.get(team), str) and event[team].strip() for team in ("team1", "team2"))
-        ):
-            matches.append(event_id)
-
-    result["eligible_matches"] = len(matches)
-    matches.sort(key=lambda event_id: (events[event_id]["startTime"], event_id))
-    queued = iter(matches)
-    completed: dict[int, tuple[Snapshot, dict[str, Any], list[dict[str, Any]], set[_FactorKey]]] = {}
-    checked: set[int] = set()
+    errors: list[dict[str, Any]] = []
+    queued = iter(eid for eid in state.matches if eid not in state.finished)
+    workers = min(state.remaining, client.policy.max_concurrency)
     local_events: dict[int, dict[str, Any]] = {}
-    local_sports = {}
-    local_line = None
-
-    async def check_matches() -> None:
-        for event_id in queued:
-            checked.add(event_id)
-            try:
-                detail = await client.event_view_snapshot(event_id, "ru")
-                narrowed = {eid: events[eid] for eid in _match_tree(children, event_id)}
-                scanned = _match_selections(event_id, narrowed, sports, line_blocks, detail.payload, end)
-                if scanned is None:
-                    continue
-                event, selections, rows = scanned
-                result["markets_processed"] += rows.processed
-                result["invalid_market_rows"] += rows.invalid
-                if rows.incomplete:
-                    errors.append(_issue("event", "incomplete_detail", event_id))
-                if rows.invalid:
-                    errors.append(_issue("event", "invalid_market_rows", event_id))
-                completed[event_id] = (detail, event, selections, rows.price_conflicts)
-            except FonbetRequestCapacityError as exc:
-                checked.discard(event_id)
-                errors.append(_error("event", exc, event_id))
-                return
-            except _RECOVERABLE as exc:
-                errors.append(_error("event", exc, event_id))
+    local_sports: dict[int, dict[str, Any]] = {}
+    valid_until = line.snapshot.effective_tick + min(client.policy.line_ttl, client.policy.max_snapshot_age)
 
     async def localize() -> None:
-        nonlocal local_events, local_sports, local_line
+        nonlocal local_events, local_sports, valid_until
+        _, _, _, _, lang = state.key
+        if lang == "ru" or not workers:
+            return
         try:
-            local_line = await client.current_line_snapshot(lang)
-            local_events, local_sports = _line_indexes(local_line.payload)
+            snapshot = await client.current_line_snapshot(lang)
+            if snapshot.age() >= client.policy.max_snapshot_age:
+                errors.append(_issue("localization", "stale_snapshot"))
+            else:
+                local_events, local_sports = _line_indexes(snapshot.payload)
+                valid_until = min(valid_until, snapshot.effective_tick + client.policy.line_ttl)
         except _RECOVERABLE as exc:
             errors.append(_error("localization", exc))
 
-    remaining = max(0, client.policy.max_snapshot_age - line.age())
+    async def check_matches() -> None:
+        nonlocal valid_until
+        for event_id in queued:
+            # Resumed searches keep the original universe and recheck current availability.
+            if not _eligible(line, event_id, state):
+                state.no_longer_eligible += 1
+                state.finished.add(event_id)
+                continue
+            was_checked = event_id in state.checked
+            state.checked.add(event_id)
+            try:
+                detail = await client.event_view_snapshot(event_id, "ru")
+            except FonbetRequestCapacityError as exc:
+                if not was_checked:
+                    state.checked.discard(event_id)
+                errors.append(_error("event", exc, event_id))
+                return
+            except _RECOVERABLE as exc:
+                state.errors.append(_error("event", exc, event_id))
+                state.finished.add(event_id)
+                continue
+            processing = loop.time()
+            try:
+                if detail.age() >= client.policy.max_snapshot_age:
+                    state.errors.append(_issue("event", "stale_snapshot", event_id))
+                    state.finished.add(event_id)
+                    continue
+                scanned = _match_selections(
+                    event_id, line.match_events(event_id), line.sports, line.blocks, detail.payload, state.end,
+                )
+                if scanned is None:
+                    state.no_longer_eligible += 1
+                else:
+                    _record(client, state, line, event_id, detail, scanned, local_events, local_sports)
+                    valid_until = min(valid_until, detail.effective_tick + client.policy.event_ttl)
+                state.finished.add(event_id)
+            except _RECOVERABLE as exc:
+                state.errors.append(_error("event", exc, event_id))
+                state.finished.add(event_id)
+            finally:
+                metrics.processing_seconds += loop.time() - processing
+
     try:
-        async with asyncio.timeout(remaining):
-            workers = [check_matches() for _ in range(min(len(matches), client.policy.max_concurrency))]
-            if lang != "ru" and matches:
-                workers.append(localize())
-            await asyncio.gather(*workers)
+        remaining = client.policy.max_snapshot_age - line.snapshot.age()
+        async with asyncio.timeout(max(0, remaining)):
+            await localize()
+            await asyncio.gather(*(check_matches() for _ in range(workers)))
     except TimeoutError:
         errors.append(_issue("scan", "scan_deadline"))
 
-    result["matches_checked"] = len(checked)
-    if local_line is not None and local_line.age() >= client.policy.max_snapshot_age:
-        local_events, local_sports = {}, {}
-        errors.append(_issue("localization", "stale_snapshot"))
-    for event_id, (detail, event, selections, price_conflicts) in completed.items():
-        if detail.age() >= client.policy.max_snapshot_age:
-            errors.append(_issue("event", "stale_snapshot", event_id))
-        elif event["startTime"] > datetime.now(timezone.utc).timestamp():
-            localized = local_events.get(event_id, {})
-            league = _sport_name(local_sports, localized.get("sportId"), prefer_root=False)
-            league = league or _sport_name(sports, event.get("sportId"), prefer_root=False)
-            matched, conflicts = _output_selections(
-                selections, event, league, localized, detail.received_at, requested, min_odds, max_odds,
-                price_conflicts,
-            )
-            result["matches_completed"] += 1
-            result["conflicting_markets"] += conflicts
-            if conflicts:
-                errors.append(_issue("event", "conflicting_quotes", event_id))
-            selected.extend(matched)
+    if state.rows:
+        valid_until = min(valid_until, _reuse_until(client, state.rows))
+    return errors, valid_until
 
-    result["skipped_events"] = result["root_events"] - result["matches_completed"]
-    selected.sort(key=lambda item: (
-        item["start_time"], item["event_id"], item["market_event_id"], item["factor_id"],
-        item["threshold"] or "",
-    ))
-    errors.sort(key=lambda item: (item["stage"], item["event_id"] or 0))
+
+def _record(
+    client: FonbetClient, state: SearchState, line: LineContext, event_id: int, detail: Snapshot,
+    scanned: tuple[dict[str, Any], list[dict[str, Any]], MarketRows],
+    local_events: dict[int, dict[str, Any]], local_sports: dict[int, dict[str, Any]],
+) -> None:
+    event, selections, rows = scanned
+    state.completed += 1
+    state.processed += rows.processed
+    state.invalid_rows += rows.invalid
+    if rows.incomplete:
+        state.errors.append(_issue("event", "incomplete_detail", event_id))
+    if rows.invalid:
+        state.errors.append(_issue("event", "invalid_market_rows", event_id))
+    localized = local_events.get(event_id, {})
+    league = _sport_name(local_sports, localized.get("sportId"), prefer_root=False)
+    league = league or _sport_name(line.sports, event.get("sportId"), prefer_root=False)
+    _, minimum, maximum, markets, _ = state.key
+    matched, conflicts = _output_selections(
+        selections, event, league, localized, detail.received_at, markets, minimum, maximum, rows.price_conflicts,
+    )
+    state.conflicts += conflicts
+    if conflicts:
+        state.errors.append(_issue("event", "conflicting_quotes", event_id))
+    room = client.policy.search_max_candidates - len(state.rows)
+    if len(matched) > room and not any(item["code"] == "result_capacity" for item in state.errors):
+        state.errors.append(_issue("scan", "result_capacity"))
+    state.rows.extend(Quote(
+        row, event["startTime"], detail.received_tick, detail.effective_tick,
+        line.snapshot.received_tick, line.snapshot.effective_tick, state.revision + 1,
+    ) for row in matched[:room])
+
+
+def _reuse_until(client: FonbetClient, quotes: list[Quote]) -> float:
+    policy = client.policy
+    available_until = min(
+        min(quote.detail_effective_tick + min(policy.event_ttl, policy.max_snapshot_age),
+            quote.line_effective_tick + min(policy.line_ttl, policy.max_snapshot_age))
+        for quote in quotes
+    )
+    seconds_to_start = min(quote.match_start for quote in quotes) - datetime.now(timezone.utc).timestamp()
+    return min(available_until, asyncio.get_running_loop().time() + seconds_to_start)
+
+
+def _quote_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row["market_event_id"], row["factor_id"], _number(row["threshold"]),
+        row["category"], row["statistic"], row["period"], row["side"], row["team_number"],
+    )
+
+
+def _superseded(
+    client: FonbetClient, state: SearchState, event_id: int, line_tick: float, detail_tick: float,
+) -> bool:
+    return client.searches.line_tick > line_tick or state.detail_ticks.get(event_id, 0) > detail_tick
+
+
+def _quote_status(client: FonbetClient, state: SearchState, quote: Quote, scan_revision: int | None) -> str:
+    if quote.match_start <= datetime.now(timezone.utc).timestamp():
+        return "started"
+    if _superseded(client, state, quote.row["event_id"], quote.line_tick, quote.detail_tick):
+        return "superseded"
+    tick = asyncio.get_running_loop().time()
+    policy = client.policy
+    if quote.revision == scan_revision:
+        return "snapshot" if tick - quote.detail_effective_tick < policy.max_snapshot_age else "stale"
+    detail_ttl = min(policy.event_ttl, policy.max_snapshot_age)
+    line_ttl = min(policy.line_ttl, policy.max_snapshot_age)
+    if tick - quote.detail_effective_tick >= detail_ttl or tick - quote.line_effective_tick >= line_ttl:
+        return "stale"
+    return "snapshot"
+
+
+@dataclass(frozen=True)
+class Verification:
+    status: str
+    received_at: str | None = None
+    detail_tick: float = 0
+    detail_effective_tick: float = 0
+    line_tick: float = 0
+    line_effective_tick: float = 0
+
+
+async def _refresh_page(
+    client: FonbetClient, state: SearchState, quotes: list[Quote], metrics: RequestMetrics,
+) -> tuple[dict[tuple[int, tuple[Any, ...]], Verification], list[dict[str, Any]]]:
+    if not quotes:
+        return {}, []
+    policy = client.policy
+    by_event: dict[int, list[Quote]] = defaultdict(list)
+    for quote in quotes:
+        by_event[quote.row["event_id"]].append(quote)
+    found: dict[tuple[int, tuple[Any, ...]], Verification] = {}
+    errors: list[dict[str, Any]] = []
+    queued = iter(by_event)
+
+    async def check(line: LineContext) -> None:
+        loop = asyncio.get_running_loop()
+        for event_id in queued:
+            current: dict[tuple[Any, ...], dict[str, Any]] = {}
+            detail = None
+            try:
+                if _eligible(line, event_id, state):
+                    detail = await client.event_view_snapshot(event_id, "ru")
+                    processing = loop.time()
+                    try:
+                        if detail.age() >= min(policy.event_ttl or policy.max_snapshot_age, policy.max_snapshot_age):
+                            errors.append(_issue("event", "stale_snapshot", event_id))
+                            continue
+                        scanned = _match_selections(
+                            event_id, line.match_events(event_id), line.sports, line.blocks, detail.payload, state.end,
+                        )
+                        if scanned is not None:
+                            event, items, rows = scanned
+                            selections, _ = _output_selections(
+                                items, event, None, {}, detail.received_at, set(), 1, float("inf"), rows.price_conflicts,
+                            )
+                            current = {_quote_identity(row): row for row in selections}
+                    finally:
+                        metrics.processing_seconds += loop.time() - processing
+            except _RECOVERABLE as exc:
+                errors.append(_error("event", exc, event_id))
+                continue
+            for quote in by_event[event_id]:
+                identity = _quote_identity(quote.row)
+                fresh = current.get(identity)
+                if fresh is None:
+                    validation = Verification("unavailable")
+                elif fresh["odds"] != quote.row["odds"] or fresh["start_time"] != quote.row["start_time"]:
+                    validation = Verification("changed")
+                else:
+                    assert detail is not None
+                    validation = Verification(
+                        "verified", detail.received_at.isoformat(), detail.received_tick, detail.effective_tick,
+                        line.snapshot.received_tick, line.snapshot.effective_tick,
+                    )
+                found[event_id, identity] = validation
+
+    try:
+        with client.candidate_search_slot():
+            line = await _line_context(client, metrics)
+            freshness = min(policy.line_ttl or policy.max_snapshot_age, policy.max_snapshot_age)
+            async with asyncio.timeout(max(0, freshness - line.snapshot.age())):
+                await asyncio.gather(*(check(line) for _ in range(min(policy.max_concurrency, len(by_event)))))
+    except TimeoutError:
+        errors.append(_issue("page", "refresh_deadline"))
+    except (FonbetSearchCapacityError, *_RECOVERABLE) as exc:
+        errors.append(_error("page", exc))
+
+    return found, errors
+
+
+async def _page(
+    client: FonbetClient, state: SearchState, view: SearchRevision, revision: int,
+    limit: int, offset: int, own_scan: bool, joined: bool, refresh: bool,
+) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    page = view.rows[offset:offset + limit]
+    scan_revision = revision if own_scan or joined else None
+    metrics = RequestMetrics()
+    token = request_metrics.set(metrics)
+    try:
+        if refresh:
+            verified, page_errors = await _refresh_page(
+                client, state, [quote for quote in page
+                                if quote.match_start > datetime.now(timezone.utc).timestamp()], metrics,
+            )
+        else:
+            verified, page_errors = {}, []
+    finally:
+        request_metrics.reset(token)
+    after_refresh = loop.time()
+    candidates = []
+    ages = []
+    for quote in page:
+        result = quote.row.copy()
+        age = max(0, after_refresh - quote.detail_effective_tick)
+        ages.append(age)
+        # Status and freshness can change while other visible quotes are being refreshed.
+        status = _quote_status(client, state, quote, scan_revision)
+        if refresh and status != "started":
+            validation = verified.get((quote.row["event_id"], _quote_identity(quote.row)))
+            status = validation.status if validation else "unverified"
+            if validation and validation.status == "verified":
+                maximum_age = client.policy.max_snapshot_age
+                verified_age = after_refresh - validation.detail_effective_tick
+                line_age = after_refresh - validation.line_effective_tick
+                if verified_age >= min(client.policy.event_ttl or maximum_age, maximum_age) or (
+                    line_age >= min(client.policy.line_ttl or maximum_age, maximum_age)
+                ):
+                    status = "stale"
+                elif _superseded(client, state, quote.row["event_id"], validation.line_tick, validation.detail_tick):
+                    status = "superseded"
+                result.update(verified_at=validation.received_at, verified_age_seconds=round(verified_age, 3))
+        if status not in {"snapshot", "verified"}:
+            result["odds"] = None
+        result.update(quote_status=status, quote_age_seconds=round(age, 3))
+        candidates.append(result)
+    counts = Counter(row["quote_status"] for row in candidates)
+    for status in counts.keys() - {"snapshot", "verified"}:
+        page_errors.append(_issue("page", f"quote_{status}"))
+    page_errors.sort(key=lambda item: (item["stage"], item["code"], item["event_id"] or 0))
+    errors = [*view.coverage["errors"], *page_errors]
+    partial = bool(view.coverage["partial"] or page_errors)
+    next_offset = offset + limit if offset + limit < len(view.rows) else None
+    metrics.processing_seconds += (loop.time() - after_refresh) + (after_refresh - start if not refresh else 0)
+    diagnostics = asdict(metrics)
+    scan_diagnostics = view.coverage["scan_diagnostics"]
+    if own_scan:
+        diagnostics = {key: value + scan_diagnostics[key] for key, value in diagnostics.items()}
+    diagnostics.update(
+        result_cache_hits=int(not own_scan and not joined),
+        result_cache_misses=int(own_scan),
+        search_coalesced=int(joined),
+        quote_age_seconds={"min": round(min(ages), 3), "max": round(max(ages), 3)} if ages else None,
+    )
+    hours, minimum, maximum, markets, language = state.key
     return {
-        **result, "status": "partial" if errors else "ok", "partial": bool(errors),
-        "error_count": len(errors), "total_candidates": len(selected),
-        "next_offset": offset + limit if offset + limit < len(selected) else None,
-        "candidates": selected[offset:offset + limit],
+        **view.coverage,
+        "status": "error" if view.coverage["status"] == "error" else "partial" if partial else "ok",
+        "partial": partial, "errors": errors, "error_count": len(errors),
+        "search_id": state.id, "revision": revision, "mode": "prematch",
+        "window_start": _timestamp(state.start), "window_end": _timestamp(state.end),
+        "filters": {
+            "hours_ahead": hours, "min_odds": minimum, "max_odds": maximum,
+            "markets": sorted(markets), "lang": language,
+        },
+        "limit": limit, "offset": offset, "next_offset": next_offset,
+        "next_cursor": f"{state.id}.{revision}.{next_offset}" if next_offset is not None else None,
+        "max_snapshot_age_seconds": client.policy.max_snapshot_age,
+        "total_candidates": len(view.rows), "candidates": candidates,
+        "quote_status_counts": dict(counts), "diagnostics": diagnostics,
     }

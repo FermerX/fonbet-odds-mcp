@@ -38,5 +38,9 @@ def load_settings() -> Settings:
             max_snapshot_age=float(os.getenv("FONBET_MAX_SNAPSHOT_AGE", "60")),
             max_inflight_requests=int(os.getenv("FONBET_MAX_INFLIGHT_REQUESTS", "32")),
             max_concurrent_searches=int(os.getenv("FONBET_MAX_CONCURRENT_SEARCHES", "2")),
+            search_cache_size=int(os.getenv("FONBET_SEARCH_CACHE_SIZE", "8")),
+            search_state_ttl=float(os.getenv("FONBET_SEARCH_STATE_TTL", "180")),
+            search_max_candidates=int(os.getenv("FONBET_SEARCH_MAX_CANDIDATES", "10000")),
+            search_max_matches=int(os.getenv("FONBET_SEARCH_MAX_MATCHES", "3000")),
         ),
     )

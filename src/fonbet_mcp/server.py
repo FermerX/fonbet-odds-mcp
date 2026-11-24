@@ -270,16 +270,25 @@ async def fonbet_find_candidates(
     limit: int = 50,
     offset: int = 0,
     lang: str = "ru",
+    search_id: str | None = None,
+    cursor: str | None = None,
+    resume: bool = False,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Find identified prematch football selections within an odds range and start-time window.
 
     Market filters (OR): goals, corners, yellow_cards, totals, individual_totals,
     outcomes, handicaps, double_chance, both_teams_score, halves, statistics,
     fouls, shots_on_target, offsides, throw_ins, goal_kicks, shots, woodwork.
-    hours_ahead must be greater than 0 and at most 12. Use next_offset to page. Check partial and errors for coverage and received_at
-    for quote freshness. This screens prices without estimating win probability.
+    hours_ahead must be greater than 0 and at most 12. Use next_cursor for a stable
+    page or next_offset for legacy paging. Pass search_id and resume=true to check
+    remaining matches. Use refresh=true with a search_id or cursor to verify only
+    the displayed page. Check partial, quote_status and received_at before use.
     """
-    return await search_candidates(get_client(), hours_ahead, min_odds, max_odds, markets, limit, offset, lang)
+    return await search_candidates(
+        get_client(), hours_ahead, min_odds, max_odds, markets, limit, offset, lang,
+        search_id, cursor, resume, refresh,
+    )
 
 
 def main() -> None:
