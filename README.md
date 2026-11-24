@@ -72,6 +72,45 @@ If you create a Web Service manually instead of Blueprint:
 - `get_same_game_parlay` - inspect one event for same-game parlay ideas.
 - `get_cross_match_specials` - inspect special-style markets across multiple events.
 - `fonbet_value_check` - simple value-bet check from your estimated probability.
+- `football_team_form` - optional, independent historical team form from football-data.org.
+
+## Independent football-data.org team form (optional)
+
+This second, independent source is **disabled until an API token is configured**.
+Create an API token with football-data.org and set **FOOTBALL_DATA_API_TOKEN**
+as a secret environment variable on the Render service (or locally).
+Never commit tokens to Git, paste them into a chat, or expose them in logs.
+No external API request is made without a configured token. Existing Fonbet
+odds tools remain available when this source is disabled.
+
+Example MCP call:
+
+```json
+{"team_id": 65, "last_n": 10}
+```
+
+The team ID in this call must be a **football-data.org team ID**. It is
+not a Fonbet event/team ID. This phase intentionally does not guess mappings
+between the services; cross-provider matching requires an independently
+validated team-identity layer. For historical research, use an explicit
+timezone-aware `as_of_utc` value, e.g. `2026-11-01T18:00:00+00:00`,
+which strictly excludes games played after that instant.
+
+The response contains the latest available completed match sample and overall,
+home and away summaries: W/D/L, reported full-time goals for/against, rates for
+over 2.5 match goals and both teams scoring. A date-bounded result is cached
+for ten minutes. The provider client limits requests to at most approximately
+one every 6.5 seconds and uses a 12-second timeout; errors, missing coverage,
+incomplete samples, and possible provider truncation are explicit. The results
+are subject to the provider plan's competition coverage and are not independent
+of all data quality issues.
+
+**Important:** team form alone does not establish outcome probabilities.
+There is no xG, injury feed, referee data, player data, weather data, model
+calibration, or automated bet placement in this phase. Never treat
+`win_percent` or `over_2_5_percent` as a calibrated probability for a
+future bet, and never equate a football-data.org reported match score with
+bookmaker market settlement. Data provided by football-data.org.
 
 ## Find prematch football candidates
 
