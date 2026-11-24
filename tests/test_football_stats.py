@@ -82,6 +82,7 @@ class TeamFormTests(unittest.IsolatedAsyncioTestCase):
             game(5, self.now - timedelta(days=2), None, 1),
             game(6, self.now - timedelta(days=2), 1, 0, home=99, away=98),
             game(7, self.now - timedelta(days=2), 3, 2, status="IN_PLAY"),
+            game(8, self.now - timedelta(hours=2), 4, 0, status="FINISHED"),
         ])
         r = await self.client.team_form(10, last_n=10, as_of_utc=self.now.isoformat())
         self.assertEqual(r["status"], "insufficient_data")
